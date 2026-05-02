@@ -12,12 +12,13 @@ RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-in
     wget curl procps cabextract unzip dos2unix xdotool \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+RUN pip install --no-cache-dir mt5linux rpyc
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
 # =========================================================
-# V18 - FULL MQL5 BINANCE LEAD-LAG ARBITRAGE
+# V16.3 - PROFIT-MAX VELOCITY BOT (ULTRA PROFITABILITY)
 # =========================================================
-RUN cat > /root/VALETAX_CROSS_ARB_V18.mq5 << 'EOF'
+RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 #include <Trade\Trade.mqh>
 
 #property copyright "Omni-Apex V18"
@@ -108,7 +109,7 @@ void OnTick() {
 EOF
 
 # ============================================
-# ENTRYPOINT
+# 3. INSTALLATION & ENTRYPOINT
 # ============================================
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
@@ -123,16 +124,19 @@ wineboot --init
 sleep 5
 MT5_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
 [ ! -f "$MT5_EXE" ] && wine /root/mt5setup.exe /auto && sleep 90
-
-MQL5_DIR=$(find /root/.wine -type d -name "MQL5" | grep "Terminal" | head -n 1)
-mkdir -p "$MQL5_DIR/Experts"
-cp /root/VALETAX_CROSS_ARB_V18.mq5 "$MQL5_DIR/Experts/VALETAX_CROSS_ARB_V18.mq5"
-wine "/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe" /compile:"$MQL5_DIR/Experts/VALETAX_CROSS_ARB_V18.mq5"
-
 wine "$MT5_EXE" &
+sleep 30
+
+DATA_DIR=$(find /root/.wine -type d -path "*MetaQuotes/Terminal/*/MQL5" | head -n 1)
+[ -z "$DATA_DIR" ] && DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
+mkdir -p "$DATA_DIR/Experts"
+cp /root/VALETAX_TICK_BOT_V16.mq5 "$DATA_DIR/Experts/VALETAX_TICK_BOT_V16.mq5"
+wine "/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe" /compile:"$DATA_DIR/Experts/VALETAX_TICK_BOT_V16.mq5" /log:"/root/compile.log"
+
+python3 -m mt5linux --host 0.0.0.0 --port 8001 &
 tail -f /dev/null
 EOF
 
 RUN chmod +x /entrypoint.sh && dos2unix /entrypoint.sh
-EXPOSE 8080
+EXPOSE 8080 8001
 CMD ["/bin/bash", "/entrypoint.sh"]
