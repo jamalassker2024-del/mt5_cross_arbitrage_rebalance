@@ -21,87 +21,94 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 #include <Trade\Trade.mqh>
 
-#property copyright "Omni-Apex V19.3 FIXED"
-#property version   "19.30"
+#property copyright "Omni-Apex V19.4"
+#property version   "19.40"
 #property strict
 
-// --- INPUTS
+// --- AGGRESSIVE INPUTS
 input string BinanceSymbol     = "BTCUSDT";
-input double RiskPercent       = 3.0;
-input int    MinGap_BPS        = 2;          // MODIFIED: Lowered to 2 for ultra-sensitivity
-input int    Fee_BPS           = 14;
-input int    TradeCooldown_Sec = 1;
-input int    MaxOpenPositions  = 10;
-input int    MaxSpreadPoints   = 500;
+input double RiskPercent       = 3.0;      
+input int    MinGap_BPS        = 2;          // Ultra low threshold[cite: 1]
+input int    Fee_BPS           = 12;         // Adjusted for speed[cite: 1]
+input int    MaxOpenPositions  = 15;         // Massive stacking allowed[cite: 2]
 input int    MagicNumber       = 999019;
 
 // --- GLOBALS
 CTrade trade;
 string binance_url;
-datetime last_trade_time = 0;
 
-double ExtractPrice(string text, string key) {
+int OnInit() {
+   binance_url = "https://api.binance.com/api/v3/ticker/bookTicker?symbol=" + BinanceSymbol;
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetTypeFilling(ORDER_FILLING_IOC);[cite: 2]
+   
+   Print("🛠️ DEBUG: Initialization complete. Target Lead: ", BinanceSymbol);
+   return(INIT_SUCCEEDED);
+}
+
+// --- HELPER: SAFE JSON EXTRACTION
+double GetVal(string text, string key) {
    int pos = StringFind(text, key);
    if(pos == -1) return 0;
    int start = pos + StringLen(key);
    int end = StringFind(text, "\"", start);
-   if(end == -1) return 0;
    return StringToDouble(StringSubstr(text, start, end - start));
 }
 
-double GetDynamicLot() {
-   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double lot = (equity / 1000.0) * (RiskPercent / 2.0) * 0.2;
-   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   return NormalizeDouble(MathMax(minLot, lot), 2);
-}
-
-void OnInit() {
-   binance_url = "https://api.binance.com/api/v3/ticker/bookTicker?symbol=" + BinanceSymbol;
-   trade.SetExpertMagicNumber(MagicNumber);
-   trade.SetTypeFilling(ORDER_FILLING_IOC);
-   trade.SetDeviationInPoints(30);
-   Print("🚀 V19.3 ULTRA-SENSITIVE ONLINE | MinGap: 2");
-}
-
 void OnTick() {
+   // 1. MONITOR AND AUTO-CLOSE FOR FAST PROFIT[cite: 1]
+   for(int i=PositionsTotal()-1; i>=0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
+         double profit = PositionGetDouble(POSITION_PROFIT);
+         if(profit > 0) { // Fast exit as soon as green
+            trade.PositionClose(ticket);
+            Print("✅ DEBUG: Fast Exit! Profit: ", profit);
+         }
+      }
+   }
+
    if(PositionsTotal() >= MaxOpenPositions) return;
-   if(TimeCurrent() - last_trade_time < TradeCooldown_Sec) return;
+
+   // 2. FETCH LEAD DATA[cite: 1]
+   char post[], result[];
+   string headers;
+   int res = WebRequest("GET", binance_url, NULL, NULL, 50, post, 0, result, headers);[cite: 2]
+
+   if(res <= 0) {
+      Print("⚠️ DEBUG: WebRequest Failed. Error: ", GetLastError());
+      return;
+   }
+
+   string resp = CharArrayToString(result);
+   double b_ask = GetVal(resp, "\"askPrice\":\"");
+   double b_bid = GetVal(resp, "\"bidPrice\":\"");
+
+   if(b_ask <= 0 || b_bid <= 0) {
+      Print("⚠️ DEBUG: Failed to parse Binance JSON. Response: ", resp);
+      return;
+   }
 
    double m_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double m_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double spread = (m_ask - m_bid) / _Point;
-   if(spread > MaxSpreadPoints) return;
-
-   char post[], result[];
-   string headers;
-   int timeout = 100;
    
-   int res = WebRequest("GET", binance_url, NULL, NULL, timeout, post, 0, result, headers);
-   if(res <= 0) return;
-
-   string response = CharArrayToString(result);
-   double b_ask = ExtractPrice(response, "\"askPrice\":\"");
-   double b_bid = ExtractPrice(response, "\"bidPrice\":\"");
-   if(b_ask <= 0 || b_bid <= 0) return;
-
+   // 3. ARBITRAGE CALCULATION[cite: 1]
    double buy_gap = (b_bid - m_ask) / m_ask * 10000.0;
    double sell_gap = (m_bid - b_ask) / b_ask * 10000.0;
-   double lot = GetDynamicLot();
 
+   // 4. EXECUTE[cite: 1, 2]
    if(buy_gap > (MinGap_BPS + Fee_BPS)) {
-      if(trade.Buy(lot, _Symbol, m_ask, 0, 0, "Apex Aggressor")) {
-         last_trade_time = TimeCurrent();
-         Print("🔥 BUY | Gap: ", buy_gap);
-      }
+      double lot = (AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0) * (RiskPercent/2.0) * 0.2;
+      if(trade.Buy(lot, _Symbol, m_ask, 0, 0, "Sonic Buy"))
+         PrintFormat("🔥 DEBUG: BUY OPEN | Gap: %.2f | Price: %.2f", buy_gap, m_ask);
    }
    else if(sell_gap > (MinGap_BPS + Fee_BPS)) {
-      if(trade.Sell(lot, _Symbol, m_bid, 0, 0, "Apex Aggressor")) {
-         last_trade_time = TimeCurrent();
-         Print("🔥 SELL | Gap: ", sell_gap);
-      }
+      double lot = (AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0) * (RiskPercent/2.0) * 0.2;
+      if(trade.Sell(lot, _Symbol, m_bid, 0, 0, "Sonic Sell"))
+         PrintFormat("🔥 DEBUG: SELL OPEN | Gap: %.2f | Price: %.2f", sell_gap, m_bid);
    }
 }
+
 
 EOF
 
