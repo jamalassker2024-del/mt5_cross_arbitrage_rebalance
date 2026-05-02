@@ -12,25 +12,23 @@ RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-in
     wget curl procps cabextract unzip dos2unix xdotool \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir mt5linux rpyc
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
 # =========================================================
-# V16.3 - PROFIT-MAX VELOCITY BOT (ULTRA PROFITABILITY)
+# V18.1 - FIXED COMPILATION & ENHANCED ARBITRAGE LOGIC
 # =========================================================
-RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
+RUN cat > /root/VALETAX_CROSS_ARB_V18.mq5 << 'EOF'
 #include <Trade\Trade.mqh>
 
-#property copyright "Omni-Apex V18"
-#property version   "18.00"
+#property copyright "Omni-Apex V18.1"
+#property version   "18.10"
 #property strict
 
 // --- INPUTS
-input string BinanceSymbol     = "BTCUSDT";  // Binance Reference Symbol
-input double RiskPercent       = 2.0;         // Exponential Growth[cite: 2]
-input int    MinGap_BPS        = 8;           // Min Gap to trade (8bps)[cite: 1]
-input int    Fee_BPS           = 16;          // Fees to cover (15.5bps rounded)[cite: 1]
-input int    MaxSpread_Pips    = 500;         
+input string BinanceSymbol     = "BTCUSDT";  // Binance Lead Symbol
+input double RiskPercent       = 2.0;        // Risk per trade for Exponential Growth[cite: 2]
+input int    MinGap_BPS        = 8;          // Minimum profitable spread in bps[cite: 1]
+input int    Fee_BPS           = 16;         // Total fees to cover (~15.5 bps)[cite: 1]
 input int    MagicNumber       = 999018;
 
 // --- GLOBALS
@@ -41,75 +39,70 @@ int OnInit() {
    binance_url = "https://api.binance.com/api/v3/ticker/bookTicker?symbol=" + BinanceSymbol;
    trade.SetExpertMagicNumber(MagicNumber);
    
-   // Check if WebRequest is allowed
-   if(!TerminalInfoInteger(TERMINAL_HTTP_ENABLED)) {
-      Print("❌ ERROR: WebRequest is not enabled. Add api.binance.com to the allowed list.");
-      return(INIT_FAILED);
-   }
-   
-   Print("V18 ARBITRAGE START: Lead=", BinanceSymbol, " | Lag=", _Symbol);
+   Print("V18.1 ARB ONLINE: Monitoring Binance Lead for Lag on ", _Symbol);
    return(INIT_SUCCEEDED);
 }
 
-// --- EXPONENTIAL LOT CALCULATION[cite: 2]
+// --- DYNAMIC LOTS FOR EXPONENTIAL GROWTH[cite: 2]
 double GetDynamicLot() {
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double lot = (equity * (RiskPercent / 100.0)) / 1000.0; // Simplified scaling
+   // Scale lot based on equity; for crypto, 0.01 per $1000 is a common starting point
+   double lot = (equity / 1000.0) * (RiskPercent / 2.0) * 0.1; 
    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   return NormalizeDouble(MathMax(minLot, lot), 2);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   return NormalizeDouble(MathMax(minLot, MathMin(maxLot, lot)), 2);
 }
 
 void OnTick() {
    char post[], result[];
    string headers;
+   // Small timeout (50ms) to ensure we stay in the "Lead" window[cite: 1]
    int res = WebRequest("GET", binance_url, NULL, NULL, 50, post, 0, result, headers);
 
    if(res == -1) {
-      Print("WebRequest Error: ", GetLastError());
+      int err = GetLastError();
+      if(err == 4014) Print("❌ WebRequest Error: Add api.binance.com to Tools -> Options -> Expert Advisors");
       return;
    }
 
-   // --- FAST PARSE BINANCE PRICE (Simple string search)
    string response = CharArrayToString(result);
+   
+   // --- PARSE BINANCE (LEAD) PRICES[cite: 1]
    int ask_pos = StringFind(response, "\"askPrice\":\"");
-   if(ask_pos == -1) return;
-   
-   string ask_str = StringSubstr(response, ask_pos + 12);
-   double binance_ask = StringToDouble(StringSubstr(ask_str, 0, StringFind(ask_str, "\"")));
-   
    int bid_pos = StringFind(response, "\"bidPrice\":\"");
-   string bid_str = StringSubstr(response, bid_pos + 12);
-   double binance_bid = StringToDouble(StringSubstr(bid_str, 0, StringFind(bid_str, "\"")));
+   if(ask_pos == -1 || bid_pos == -1) return;
+   
+   double b_ask = StringToDouble(StringSubstr(response, ask_pos + 12));
+   double b_bid = StringToDouble(StringSubstr(response, bid_pos + 12));
 
-   // --- COMPARE WITH MT5 LAG
-   double mt5_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double mt5_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   // --- GET MT5 (LAG) PRICES
+   double m_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double m_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    
    // Calculate Gap in Basis Points (BPS)[cite: 1]
-   double buy_gap_bps = (binance_bid - mt5_ask) / mt5_ask * 10000;
-   double sell_gap_bps = (mt5_bid - binance_ask) / binance_ask * 10000;
+   // Buy on MT5 if Binance Bid is higher than MT5 Ask + Fees
+   double buy_gap_bps = (b_bid - m_ask) / m_ask * 10000;
+   // Sell on MT5 if Binance Ask is lower than MT5 Bid - Fees
+   double sell_gap_bps = (m_bid - b_ask) / b_ask * 10000;
 
    if(PositionsTotal() >= 1) return;
 
-   // EXECUTE IF PROFITABLE AFTER FEES[cite: 1]
+   // EXECUTE IF GAP COVERS MIN SPREAD + FEES[cite: 1]
    if(buy_gap_bps > (MinGap_BPS + Fee_BPS)) {
       double lot = GetDynamicLot();
-      double tp = mt5_ask + (buy_gap_bps * 0.5 * point * 10); // Take profit halfway
-      PrintFormat("🎯 ARB BUY: Gap %.2f bps | Lot: %.2f", buy_gap_bps, lot);
-      trade.Buy(lot, _Symbol, mt5_ask, 0, tp, "Arb Lead Buy");
+      PrintFormat("🎯 LEAD-LAG BUY | Gap: %.2f bps | BinanceBid: %.2f | MT5Ask: %.2f", buy_gap_bps, b_bid, m_ask);
+      trade.Buy(lot, _Symbol, m_ask, 0, 0, "Apex Arb Buy");
    }
    else if(sell_gap_bps > (MinGap_BPS + Fee_BPS)) {
       double lot = GetDynamicLot();
-      double tp = mt5_bid - (sell_gap_bps * 0.5 * point * 10);
-      PrintFormat("🎯 ARB SELL: Gap %.2f bps | Lot: %.2f", sell_gap_bps, lot);
-      trade.Sell(lot, _Symbol, mt5_bid, 0, tp, "Arb Lead Sell");
+      PrintFormat("🎯 LEAD-LAG SELL | Gap: %.2f bps | BinanceAsk: %.2f | MT5Bid: %.2f", sell_gap_bps, b_ask, m_bid);
+      trade.Sell(lot, _Symbol, m_bid, 0, 0, "Apex Arb Sell");
    }
 }
 EOF
 
 # ============================================
-# 3. INSTALLATION & ENTRYPOINT
+# ENTRYPOINT
 # ============================================
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
@@ -124,19 +117,16 @@ wineboot --init
 sleep 5
 MT5_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
 [ ! -f "$MT5_EXE" ] && wine /root/mt5setup.exe /auto && sleep 90
+
+MQL5_DIR=$(find /root/.wine -type d -name "MQL5" | grep "Terminal" | head -n 1)
+mkdir -p "$MQL5_DIR/Experts"
+cp /root/VALETAX_CROSS_ARB_V18.mq5 "$MQL5_DIR/Experts/VALETAX_CROSS_ARB_V18.mq5"
+wine "/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe" /compile:"$MQL5_DIR/Experts/VALETAX_CROSS_ARB_V18.mq5"
+
 wine "$MT5_EXE" &
-sleep 30
-
-DATA_DIR=$(find /root/.wine -type d -path "*MetaQuotes/Terminal/*/MQL5" | head -n 1)
-[ -z "$DATA_DIR" ] && DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
-mkdir -p "$DATA_DIR/Experts"
-cp /root/VALETAX_TICK_BOT_V16.mq5 "$DATA_DIR/Experts/VALETAX_TICK_BOT_V16.mq5"
-wine "/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe" /compile:"$DATA_DIR/Experts/VALETAX_TICK_BOT_V16.mq5" /log:"/root/compile.log"
-
-python3 -m mt5linux --host 0.0.0.0 --port 8001 &
 tail -f /dev/null
 EOF
 
 RUN chmod +x /entrypoint.sh && dos2unix /entrypoint.sh
-EXPOSE 8080 8001
+EXPOSE 8080
 CMD ["/bin/bash", "/entrypoint.sh"]
