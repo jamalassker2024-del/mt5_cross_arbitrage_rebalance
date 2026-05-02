@@ -12,86 +12,103 @@ RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-in
     wget curl procps cabextract unzip dos2unix xdotool \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir mt5linux rpyc
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
-# ============================================
-# V16 - ULTRA-AGGRESSIVE MOMENTUM TICK BOT
-# ============================================
-RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
+# =========================================================
+# V18 - FULL MQL5 BINANCE LEAD-LAG ARBITRAGE
+# =========================================================
+RUN cat > /root/VALETAX_CROSS_ARB_V18.mq5 << 'EOF'
 #include <Trade\Trade.mqh>
-#property copyright "Omni-Apex V17.1"
-#property version   "17.10"
+
+#property copyright "Omni-Apex V18"
+#property version   "18.00"
 #property strict
 
-input double RiskPercent      = 2.0;      
-input double OFI_Threshold    = 1.15;     
-input int    LookbackTicks    = 12;       
-input double RewardToSpread   = 2.5;      
-input double SLToSpread       = 1.5;      
-input int    MaxSpread_Pips   = 450;      
-input int    MagicNumber      = 999017;
+// --- INPUTS
+input string BinanceSymbol     = "BTCUSDT";  // Binance Reference Symbol
+input double RiskPercent       = 2.0;         // Exponential Growth[cite: 2]
+input int    MinGap_BPS        = 8;           // Min Gap to trade (8bps)[cite: 1]
+input int    Fee_BPS           = 16;          // Fees to cover (15.5bps rounded)[cite: 1]
+input int    MaxSpread_Pips    = 500;         
+input int    MagicNumber       = 999018;
 
-struct TickRecord { int dir; long vol; long msc; };
-TickRecord tickBuffer[];
-int tickIdx = 0;
+// --- GLOBALS
 CTrade trade;
-double lastPrice = 0;
+string binance_url;
 
 int OnInit() {
-   ArrayResize(tickBuffer, LookbackTicks);
+   binance_url = "https://api.binance.com/api/v3/ticker/bookTicker?symbol=" + BinanceSymbol;
    trade.SetExpertMagicNumber(MagicNumber);
-   uint filling = (uint)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
-   if((filling & SYMBOL_FILLING_FOK) != 0) trade.SetTypeFilling(ORDER_FILLING_FOK);
-   else if((filling & SYMBOL_FILLING_IOC) != 0) trade.SetTypeFilling(ORDER_FILLING_IOC);
-   else trade.SetTypeFilling(ORDER_FILLING_RETURN);
-   Print("V17.1 ONLINE");
+   
+   // Check if WebRequest is allowed
+   if(!TerminalInfoInteger(TERMINAL_HTTP_ENABLED)) {
+      Print("❌ ERROR: WebRequest is not enabled. Add api.binance.com to the allowed list.");
+      return(INIT_FAILED);
+   }
+   
+   Print("V18 ARBITRAGE START: Lead=", BinanceSymbol, " | Lag=", _Symbol);
    return(INIT_SUCCEEDED);
 }
 
-double GetDynamicLot(double sl_points) {
+// --- EXPONENTIAL LOT CALCULATION[cite: 2]
+double GetDynamicLot() {
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   if(sl_points <= 0 || tickValue <= 0) return 0.1;
-   double lot = (equity * (RiskPercent / 100.0)) / (sl_points * (tickValue / tickSize));
-   return NormalizeDouble(MathMax(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN), MathMin(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX), lot)), 2);
+   double lot = (equity * (RiskPercent / 100.0)) / 1000.0; // Simplified scaling
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   return NormalizeDouble(MathMax(minLot, lot), 2);
 }
 
 void OnTick() {
-   MqlTick curr;
-   if(!SymbolInfoTick(_Symbol, curr)) return;
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double spread_points = (curr.ask - curr.bid) / point;
-   int direction = (lastPrice > 0) ? (curr.bid > lastPrice ? 1 : (curr.bid < lastPrice ? -1 : 0)) : 0;
-   lastPrice = curr.bid;
-   tickBuffer[tickIdx % LookbackTicks].dir = direction;
-   tickBuffer[tickIdx % LookbackTicks].vol = (curr.volume_real > 0) ? (long)curr.volume_real : 1;
-   tickBuffer[tickIdx % LookbackTicks].msc = curr.time_msc;
-   tickIdx++;
-   if(tickIdx < LookbackTicks || PositionsTotal() >= 1) return;
-   long buyVol = 0, sellVol = 0; int momentum = 0;
-   for(int i=0; i<LookbackTicks; i++) {
-      if(tickBuffer[i].dir > 0) { buyVol += tickBuffer[i].vol; momentum++; }
-      if(tickBuffer[i].dir < 0) { sellVol += tickBuffer[i].vol; momentum--; }
+   char post[], result[];
+   string headers;
+   int res = WebRequest("GET", binance_url, NULL, NULL, 50, post, 0, result, headers);
+
+   if(res == -1) {
+      Print("WebRequest Error: ", GetLastError());
+      return;
    }
-   long timeElapsed = tickBuffer[(tickIdx-1)%LookbackTicks].msc - tickBuffer[tickIdx%LookbackTicks].msc;
-   if(timeElapsed > 1500 || timeElapsed <= 0) return;
-   double ratio = (sellVol > 0) ? (double)buyVol / (double)sellVol : (double)buyVol;
-   double sl_dist_pts = spread_points * SLToSpread;
-   double tp_dist_pts = spread_points * RewardToSpread;
-   double lot = GetDynamicLot(sl_dist_pts);
-   if(ratio >= OFI_Threshold && momentum > (LookbackTicks/2)) {
-      trade.Buy(lot, _Symbol, curr.ask, curr.ask - (sl_dist_pts * point), curr.ask + (tp_dist_pts * point), "Apex");
-   } else if(ratio <= (1.0 / OFI_Threshold) && momentum < -(LookbackTicks/2)) {
-      trade.Sell(lot, _Symbol, curr.bid, curr.bid + (sl_dist_pts * point), curr.bid - (tp_dist_pts * point), "Apex");
+
+   // --- FAST PARSE BINANCE PRICE (Simple string search)
+   string response = CharArrayToString(result);
+   int ask_pos = StringFind(response, "\"askPrice\":\"");
+   if(ask_pos == -1) return;
+   
+   string ask_str = StringSubstr(response, ask_pos + 12);
+   double binance_ask = StringToDouble(StringSubstr(ask_str, 0, StringFind(ask_str, "\"")));
+   
+   int bid_pos = StringFind(response, "\"bidPrice\":\"");
+   string bid_str = StringSubstr(response, bid_pos + 12);
+   double binance_bid = StringToDouble(StringSubstr(bid_str, 0, StringFind(bid_str, "\"")));
+
+   // --- COMPARE WITH MT5 LAG
+   double mt5_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double mt5_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   
+   // Calculate Gap in Basis Points (BPS)[cite: 1]
+   double buy_gap_bps = (binance_bid - mt5_ask) / mt5_ask * 10000;
+   double sell_gap_bps = (mt5_bid - binance_ask) / binance_ask * 10000;
+
+   if(PositionsTotal() >= 1) return;
+
+   // EXECUTE IF PROFITABLE AFTER FEES[cite: 1]
+   if(buy_gap_bps > (MinGap_BPS + Fee_BPS)) {
+      double lot = GetDynamicLot();
+      double tp = mt5_ask + (buy_gap_bps * 0.5 * point * 10); // Take profit halfway
+      PrintFormat("🎯 ARB BUY: Gap %.2f bps | Lot: %.2f", buy_gap_bps, lot);
+      trade.Buy(lot, _Symbol, mt5_ask, 0, tp, "Arb Lead Buy");
+   }
+   else if(sell_gap_bps > (MinGap_BPS + Fee_BPS)) {
+      double lot = GetDynamicLot();
+      double tp = mt5_bid - (sell_gap_bps * 0.5 * point * 10);
+      PrintFormat("🎯 ARB SELL: Gap %.2f bps | Lot: %.2f", sell_gap_bps, lot);
+      trade.Sell(lot, _Symbol, mt5_bid, 0, tp, "Arb Lead Sell");
    }
 }
-
 EOF
 
 # ============================================
-# 5. ENTRYPOINT WITH AUTO-ATTACH & COMPILE
+# ENTRYPOINT
 # ============================================
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
@@ -106,20 +123,16 @@ wineboot --init
 sleep 5
 MT5_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
 [ ! -f "$MT5_EXE" ] && wine /root/mt5setup.exe /auto && sleep 90
+
+MQL5_DIR=$(find /root/.wine -type d -name "MQL5" | grep "Terminal" | head -n 1)
+mkdir -p "$MQL5_DIR/Experts"
+cp /root/VALETAX_CROSS_ARB_V18.mq5 "$MQL5_DIR/Experts/VALETAX_CROSS_ARB_V18.mq5"
+wine "/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe" /compile:"$MQL5_DIR/Experts/VALETAX_CROSS_ARB_V18.mq5"
+
 wine "$MT5_EXE" &
-sleep 30
-
-# Compile EA
-DATA_DIR=$(find /root/.wine -type d -path "*MetaQuotes/Terminal/*/MQL5" | head -n 1)
-[ -z "$DATA_DIR" ] && DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
-mkdir -p "$DATA_DIR/Experts"
-cp /root/VALETAX_TICK_BOT_V16.mq5 "$DATA_DIR/Experts/VALETAX_TICK_BOT_V16.mq5"
-wine "/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe" /compile:"$DATA_DIR/Experts/VALETAX_TICK_BOT_V16.mq5" /log:"/root/compile.log"
-
-python3 -m mt5linux --host 0.0.0.0 --port 8001 &
 tail -f /dev/null
 EOF
 
 RUN chmod +x /entrypoint.sh && dos2unix /entrypoint.sh
-EXPOSE 8080 8001
+EXPOSE 8080
 CMD ["/bin/bash", "/entrypoint.sh"]
