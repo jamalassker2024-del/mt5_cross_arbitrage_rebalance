@@ -21,91 +21,165 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 #include <Trade\Trade.mqh>
 
-#property copyright "Omni-Apex V20.0"
-#property version   "20.00"
+#property copyright "Omni-Apex V21.0"
+#property version   "21.00"
 #property strict
 
-// --- AGGRESSIVE LOOSE INPUTS
+// --- INPUTS (ultra loose)
 input string BinanceSymbol     = "BTCUSDT";
-input double RiskPercent       = 8.0;       // Larger risk for bigger lots
-input int    MinGap_BPS        = 0;         // Any positive gap triggers trade
-input int    Fee_BPS           = 3;         // Almost ignore fees
-input int    MaxOpenPositions  = 50;        // Huge stacking allowed
-input int    MagicNumber       = 999020;
+input double RiskPercent       = 5.0;       // Position size = equity * RiskPercent / 1000
+input int    MinGap_BPS        = 0;         // Open trade on ANY positive gap
+input int    Fee_BPS           = 1;         // Almost ignore fees (1 bps = 0.01%)
+input int    MaxOpenPositions  = 30;
+input int    MagicNumber       = 999021;
 
 // --- GLOBALS
 CTrade trade;
 string binance_url;
+datetime last_debug_time = 0;
 
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
 int OnInit() {
    binance_url = "https://api.binance.com/api/v3/ticker/bookTicker?symbol=" + BinanceSymbol;
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
    
-   Print("🛠️ DEBUG: V20.0 LOOSE MODE - Target Lead: ", BinanceSymbol);
+   // Ensure symbol is visible in Market Watch
+   SymbolSelect(_Symbol, true);
+   
+   Print("==============================================");
+   Print("🟢 EA V21.0 INITIALIZED (Ultra Loose + Debug)");
+   Print("   Target Binance Symbol: ", BinanceSymbol);
+   Print("   MT5 Symbol: ", _Symbol);
+   Print("   MinGap_BPS: ", MinGap_BPS);
+   Print("   Fee_BPS: ", Fee_BPS);
+   Print("==============================================");
    return(INIT_SUCCEEDED);
 }
 
-// --- HELPER: SAFE JSON EXTRACTION
-double GetVal(string text, string key) {
-   int pos = StringFind(text, key);
-   if(pos == -1) return 0;
-   int start = pos + StringLen(key);
-   int end = StringFind(text, "\"", start);
-   return StringToDouble(StringSubstr(text, start, end - start));
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason) {
+   Print("🔴 EA deinitialized. Reason: ", reason);
 }
 
+//+------------------------------------------------------------------+
+//| Helper: Extract double from JSON string                          |
+//+------------------------------------------------------------------+
+double GetJsonDouble(string text, string key) {
+   int pos = StringFind(text, key);
+   if(pos == -1) return -1;
+   int start = pos + StringLen(key);
+   int end = StringFind(text, "\"", start);
+   if(end == -1) end = StringFind(text, ",", start);
+   if(end == -1) end = StringLen(text);
+   string substr = StringSubstr(text, start, end - start);
+   return StringToDouble(substr);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
 void OnTick() {
-   // 1. INSTANT CLOSE ON ANY PROFIT (FAST OUT)
-   for(int i=PositionsTotal()-1; i>=0; i--) {
+   // --- 1. CLOSE ANY POSITION WITH POSITIVE PROFIT (FAST OUT) ---
+   for(int i = PositionsTotal()-1; i >= 0; i--) {
       ulong ticket = PositionGetTicket(i);
       if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
          double profit = PositionGetDouble(POSITION_PROFIT);
-         if(profit > 0) {                       // Closes as soon as 1 cent profit
-            trade.PositionClose(ticket);
-            Print("✅ FAST EXIT! Profit: ", profit);
+         if(profit > 0.0) {
+            if(trade.PositionClose(ticket)) {
+               Print("✅ [CLOSE] Ticket ", ticket, " closed with profit: ", profit);
+            } else {
+               Print("❌ [CLOSE] Failed to close ticket ", ticket, ", error: ", GetLastError());
+            }
          }
       }
    }
-
-   if(PositionsTotal() >= MaxOpenPositions) return;
-
-   // 2. FETCH BINANCE DATA
-   char post[], result[];
-   string headers;
-   int res = WebRequest("GET", binance_url, NULL, NULL, 50, post, 0, result, headers);
-
-   if(res <= 0) {
-      Print("⚠️ WebRequest Failed. Error: ", GetLastError());
+   
+   // --- 2. CHECK MAX POSITIONS ---
+   if(PositionsTotal() >= MaxOpenPositions) {
+      static int throttle = 0;
+      if(throttle++ % 100 == 0) Print("⚠️ Max positions reached: ", PositionsTotal());
       return;
    }
-
-   string resp = CharArrayToString(result);
-   double b_ask = GetVal(resp, "\"askPrice\":\"");
-   double b_bid = GetVal(resp, "\"bidPrice\":\"");
-
-   if(b_ask <= 0 || b_bid <= 0) {
-      Print("⚠️ Failed to parse Binance JSON. Response: ", resp);
-      return;
-   }
-
+   
+   // --- 3. GET MT5 PRICES ---
    double m_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double m_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double m_spread = (m_ask - m_bid) / m_bid * 10000.0;  // spread in bps
    
-   // 3. ARBITRAGE GAP (ULTRA LOOSE THRESHOLD)
-   double buy_gap = (b_bid - m_ask) / m_ask * 10000.0;
-   double sell_gap = (m_bid - b_ask) / b_ask * 10000.0;
-
-   // 4. OPEN TRADES ON SMALLEST GAP (MinGap_BPS = 0)
-   if(buy_gap > (MinGap_BPS + Fee_BPS)) {
-      double lot = (AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0) * (RiskPercent/2.0) * 0.2;
-      if(trade.Buy(lot, _Symbol, m_ask, 0, 0, "Sonic Buy (Loose)"))
-         PrintFormat("🔥 BUY OPEN | Gap: %.2f bps | Price: %.2f", buy_gap, m_ask);
+   if(m_ask <= 0 || m_bid <= 0) {
+      Print("❌ MT5 price error: Ask=", m_ask, " Bid=", m_bid);
+      return;
    }
-   else if(sell_gap > (MinGap_BPS + Fee_BPS)) {
-      double lot = (AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0) * (RiskPercent/2.0) * 0.2;
-      if(trade.Sell(lot, _Symbol, m_bid, 0, 0, "Sonic Sell (Loose)"))
-         PrintFormat("🔥 SELL OPEN | Gap: %.2f bps | Price: %.2f", sell_gap, m_bid);
+   
+   // --- 4. FETCH BINANCE PRICES (WebRequest) ---
+   char post[], result[];
+   string headers;
+   // Increase timeout to 5 seconds
+   int timeout = 5000;
+   int res = WebRequest("GET", binance_url, NULL, NULL, timeout, post, 0, result, headers);
+   
+   if(res <= 0) {
+      Print("❌ WebRequest failed. Error code: ", GetLastError(), " HTTP response: ", res);
+      return;
+   }
+   
+   string resp = CharArrayToString(result);
+   // Binance returns JSON like: {"symbol":"BTCUSDT","bidPrice":"12345.67","askPrice":"12346.78",...}
+   double b_bid = GetJsonDouble(resp, "\"bidPrice\":\"");
+   double b_ask = GetJsonDouble(resp, "\"askPrice\":\"");
+   
+   if(b_bid <= 0 || b_ask <= 0) {
+      Print("❌ Failed to parse Binance prices. Raw response (first 200 chars): ", StringSubstr(resp, 0, 200));
+      return;
+   }
+   
+   // --- 5. CALCULATE ARBITRAGE GAPS (in basis points) ---
+   // Buy gap = (Binance bid - MT5 ask) / MT5 ask * 10000
+   double buy_gap  = (b_bid - m_ask) / m_ask * 10000.0;
+   // Sell gap = (MT5 bid - Binance ask) / Binance ask * 10000
+   double sell_gap = (m_bid - b_ask) / b_ask * 10000.0;
+   
+   // Threshold = MinGap_BPS + Fee_BPS (here 0 + 1 = 1 bps)
+   double threshold = MinGap_BPS + Fee_BPS;
+   
+   // --- 6. DEBUG OUTPUT (once every 5 seconds to avoid spam) ---
+   if(TimeCurrent() - last_debug_time >= 5) {
+      last_debug_time = TimeCurrent();
+      Print("========================================");
+      Print("📊 MT5  Ask: ", DoubleToString(m_ask, _Digits), "  Bid: ", DoubleToString(m_bid, _Digits));
+      Print("📊 Binance Ask: ", DoubleToString(b_ask, _Digits), " Bid: ", DoubleToString(b_bid, _Digits));
+      Print("📊 Spread (MT5): ", DoubleToString(m_spread, 2), " bps");
+      Print("📊 Buy Gap: ", DoubleToString(buy_gap, 2), " bps  (Binance bid - MT5 ask)");
+      Print("📊 Sell Gap: ", DoubleToString(sell_gap, 2), " bps  (MT5 bid - Binance ask)");
+      Print("📊 Threshold: ", threshold, " bps");
+      Print("========================================");
+   }
+   
+   // --- 7. OPEN TRADES ON POSITIVE GAP ---
+   // BUY: if Binance bid is higher than MT5 ask (buy on MT5, sell on Binance)
+   if(buy_gap > threshold) {
+      double lot = NormalizeDouble(AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPercent / 100.0), 2);
+      lot = MathMax(0.01, lot);  // Minimum 0.01 lot
+      if(trade.Buy(lot, _Symbol, m_ask, 0, 0, "Sonic BUY")) {
+         Print("🔥 [BUY OPEN] Gap: ", buy_gap, " bps | Lot: ", lot, " | Price: ", m_ask);
+      } else {
+         Print("❌ [BUY FAIL] Error: ", GetLastError());
+      }
+   }
+   // SELL: if MT5 bid is higher than Binance ask (sell on MT5, buy on Binance)
+   else if(sell_gap > threshold) {
+      double lot = NormalizeDouble(AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPercent / 100.0), 2);
+      lot = MathMax(0.01, lot);
+      if(trade.Sell(lot, _Symbol, m_bid, 0, 0, "Sonic SELL")) {
+         Print("🔥 [SELL OPEN] Gap: ", sell_gap, " bps | Lot: ", lot, " | Price: ", m_bid);
+      } else {
+         Print("❌ [SELL FAIL] Error: ", GetLastError());
+      }
    }
 }
 
