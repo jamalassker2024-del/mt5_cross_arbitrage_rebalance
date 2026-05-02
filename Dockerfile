@@ -21,85 +21,88 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 #include <Trade\Trade.mqh>
 
-#property copyright "Omni-Apex V18.1"
-#property version   "18.10"
+#property copyright "Omni-Apex V19.3 FIXED"
+#property version   "19.30"
 #property strict
 
 // --- INPUTS
-input string BinanceSymbol     = "BTCUSDT";  // Binance Lead Symbol
-input double RiskPercent       = 2.0;        // Risk per trade for Exponential Growth[cite: 2]
-input int    MinGap_BPS        = 8;          // Minimum profitable spread in bps[cite: 1]
-input int    Fee_BPS           = 16;         // Total fees to cover (~15.5 bps)[cite: 1]
-input int    MagicNumber       = 999018;
+input string BinanceSymbol     = "BTCUSDT";
+input double RiskPercent       = 3.0;
+input int    MinGap_BPS        = 2;          // MODIFIED: Lowered to 2 for ultra-sensitivity
+input int    Fee_BPS           = 14;
+input int    TradeCooldown_Sec = 1;
+input int    MaxOpenPositions  = 10;
+input int    MaxSpreadPoints   = 500;
+input int    MagicNumber       = 999019;
 
 // --- GLOBALS
 CTrade trade;
 string binance_url;
+datetime last_trade_time = 0;
 
-int OnInit() {
-   binance_url = "https://api.binance.com/api/v3/ticker/bookTicker?symbol=" + BinanceSymbol;
-   trade.SetExpertMagicNumber(MagicNumber);
-   
-   Print("V18.1 ARB ONLINE: Monitoring Binance Lead for Lag on ", _Symbol);
-   return(INIT_SUCCEEDED);
+double ExtractPrice(string text, string key) {
+   int pos = StringFind(text, key);
+   if(pos == -1) return 0;
+   int start = pos + StringLen(key);
+   int end = StringFind(text, "\"", start);
+   if(end == -1) return 0;
+   return StringToDouble(StringSubstr(text, start, end - start));
 }
 
-// --- DYNAMIC LOTS FOR EXPONENTIAL GROWTH[cite: 2]
 double GetDynamicLot() {
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   // Scale lot based on equity; for crypto, 0.01 per $1000 is a common starting point
-   double lot = (equity / 1000.0) * (RiskPercent / 2.0) * 0.1; 
+   double lot = (equity / 1000.0) * (RiskPercent / 2.0) * 0.2;
    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-   return NormalizeDouble(MathMax(minLot, MathMin(maxLot, lot)), 2);
+   return NormalizeDouble(MathMax(minLot, lot), 2);
+}
+
+void OnInit() {
+   binance_url = "https://api.binance.com/api/v3/ticker/bookTicker?symbol=" + BinanceSymbol;
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetTypeFilling(ORDER_FILLING_IOC);
+   trade.SetDeviationInPoints(30);
+   Print("🚀 V19.3 ULTRA-SENSITIVE ONLINE | MinGap: 2");
 }
 
 void OnTick() {
-   char post[], result[];
-   string headers;
-   // Small timeout (50ms) to ensure we stay in the "Lead" window[cite: 1]
-   int res = WebRequest("GET", binance_url, NULL, NULL, 50, post, 0, result, headers);
+   if(PositionsTotal() >= MaxOpenPositions) return;
+   if(TimeCurrent() - last_trade_time < TradeCooldown_Sec) return;
 
-   if(res == -1) {
-      int err = GetLastError();
-      if(err == 4014) Print("❌ WebRequest Error: Add api.binance.com to Tools -> Options -> Expert Advisors");
-      return;
-   }
-
-   string response = CharArrayToString(result);
-   
-   // --- PARSE BINANCE (LEAD) PRICES[cite: 1]
-   int ask_pos = StringFind(response, "\"askPrice\":\"");
-   int bid_pos = StringFind(response, "\"bidPrice\":\"");
-   if(ask_pos == -1 || bid_pos == -1) return;
-   
-   double b_ask = StringToDouble(StringSubstr(response, ask_pos + 12));
-   double b_bid = StringToDouble(StringSubstr(response, bid_pos + 12));
-
-   // --- GET MT5 (LAG) PRICES
    double m_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double m_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double spread = (m_ask - m_bid) / _Point;
+   if(spread > MaxSpreadPoints) return;
+
+   char post[], result[];
+   string headers;
+   int timeout = 100;
    
-   // Calculate Gap in Basis Points (BPS)[cite: 1]
-   // Buy on MT5 if Binance Bid is higher than MT5 Ask + Fees
-   double buy_gap_bps = (b_bid - m_ask) / m_ask * 10000;
-   // Sell on MT5 if Binance Ask is lower than MT5 Bid - Fees
-   double sell_gap_bps = (m_bid - b_ask) / b_ask * 10000;
+   int res = WebRequest("GET", binance_url, NULL, NULL, timeout, post, 0, result, headers);
+   if(res <= 0) return;
 
-   if(PositionsTotal() >= 1) return;
+   string response = CharArrayToString(result);
+   double b_ask = ExtractPrice(response, "\"askPrice\":\"");
+   double b_bid = ExtractPrice(response, "\"bidPrice\":\"");
+   if(b_ask <= 0 || b_bid <= 0) return;
 
-   // EXECUTE IF GAP COVERS MIN SPREAD + FEES[cite: 1]
-   if(buy_gap_bps > (MinGap_BPS + Fee_BPS)) {
-      double lot = GetDynamicLot();
-      PrintFormat("🎯 LEAD-LAG BUY | Gap: %.2f bps | BinanceBid: %.2f | MT5Ask: %.2f", buy_gap_bps, b_bid, m_ask);
-      trade.Buy(lot, _Symbol, m_ask, 0, 0, "Apex Arb Buy");
+   double buy_gap = (b_bid - m_ask) / m_ask * 10000.0;
+   double sell_gap = (m_bid - b_ask) / b_ask * 10000.0;
+   double lot = GetDynamicLot();
+
+   if(buy_gap > (MinGap_BPS + Fee_BPS)) {
+      if(trade.Buy(lot, _Symbol, m_ask, 0, 0, "Apex Aggressor")) {
+         last_trade_time = TimeCurrent();
+         Print("🔥 BUY | Gap: ", buy_gap);
+      }
    }
-   else if(sell_gap_bps > (MinGap_BPS + Fee_BPS)) {
-      double lot = GetDynamicLot();
-      PrintFormat("🎯 LEAD-LAG SELL | Gap: %.2f bps | BinanceAsk: %.2f | MT5Bid: %.2f", sell_gap_bps, b_ask, m_bid);
-      trade.Sell(lot, _Symbol, m_bid, 0, 0, "Apex Arb Sell");
+   else if(sell_gap > (MinGap_BPS + Fee_BPS)) {
+      if(trade.Sell(lot, _Symbol, m_bid, 0, 0, "Apex Aggressor")) {
+         last_trade_time = TimeCurrent();
+         Print("🔥 SELL | Gap: ", sell_gap);
+      }
    }
 }
+
 EOF
 
 # ============================================
