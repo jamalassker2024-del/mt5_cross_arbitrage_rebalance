@@ -21,17 +21,17 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 #include <Trade\Trade.mqh>
 
-#property copyright "Omni-Apex V19.4"
-#property version   "19.40"
+#property copyright "Omni-Apex V20.0"
+#property version   "20.00"
 #property strict
 
-// --- AGGRESSIVE INPUTS
+// --- AGGRESSIVE LOOSE INPUTS
 input string BinanceSymbol     = "BTCUSDT";
-input double RiskPercent       = 3.0;      
-input int    MinGap_BPS        = 2;          // Ultra low threshold[cite: 1]
-input int    Fee_BPS           = 12;         // Adjusted for speed[cite: 1]
-input int    MaxOpenPositions  = 15;         // Massive stacking allowed[cite: 2]
-input int    MagicNumber       = 999019;
+input double RiskPercent       = 8.0;       // Larger risk for bigger lots
+input int    MinGap_BPS        = 0;         // Any positive gap triggers trade
+input int    Fee_BPS           = 3;         // Almost ignore fees
+input int    MaxOpenPositions  = 50;        // Huge stacking allowed
+input int    MagicNumber       = 999020;
 
 // --- GLOBALS
 CTrade trade;
@@ -40,9 +40,9 @@ string binance_url;
 int OnInit() {
    binance_url = "https://api.binance.com/api/v3/ticker/bookTicker?symbol=" + BinanceSymbol;
    trade.SetExpertMagicNumber(MagicNumber);
-   trade.SetTypeFilling(ORDER_FILLING_IOC);[cite: 2]
+   trade.SetTypeFilling(ORDER_FILLING_IOC);
    
-   Print("🛠️ DEBUG: Initialization complete. Target Lead: ", BinanceSymbol);
+   Print("🛠️ DEBUG: V20.0 LOOSE MODE - Target Lead: ", BinanceSymbol);
    return(INIT_SUCCEEDED);
 }
 
@@ -56,27 +56,27 @@ double GetVal(string text, string key) {
 }
 
 void OnTick() {
-   // 1. MONITOR AND AUTO-CLOSE FOR FAST PROFIT[cite: 1]
+   // 1. INSTANT CLOSE ON ANY PROFIT (FAST OUT)
    for(int i=PositionsTotal()-1; i>=0; i--) {
       ulong ticket = PositionGetTicket(i);
       if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
          double profit = PositionGetDouble(POSITION_PROFIT);
-         if(profit > 0) { // Fast exit as soon as green
+         if(profit > 0) {                       // Closes as soon as 1 cent profit
             trade.PositionClose(ticket);
-            Print("✅ DEBUG: Fast Exit! Profit: ", profit);
+            Print("✅ FAST EXIT! Profit: ", profit);
          }
       }
    }
 
    if(PositionsTotal() >= MaxOpenPositions) return;
 
-   // 2. FETCH LEAD DATA[cite: 1]
+   // 2. FETCH BINANCE DATA
    char post[], result[];
    string headers;
-   int res = WebRequest("GET", binance_url, NULL, NULL, 50, post, 0, result, headers);[cite: 2]
+   int res = WebRequest("GET", binance_url, NULL, NULL, 50, post, 0, result, headers);
 
    if(res <= 0) {
-      Print("⚠️ DEBUG: WebRequest Failed. Error: ", GetLastError());
+      Print("⚠️ WebRequest Failed. Error: ", GetLastError());
       return;
    }
 
@@ -85,27 +85,27 @@ void OnTick() {
    double b_bid = GetVal(resp, "\"bidPrice\":\"");
 
    if(b_ask <= 0 || b_bid <= 0) {
-      Print("⚠️ DEBUG: Failed to parse Binance JSON. Response: ", resp);
+      Print("⚠️ Failed to parse Binance JSON. Response: ", resp);
       return;
    }
 
    double m_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double m_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    
-   // 3. ARBITRAGE CALCULATION[cite: 1]
+   // 3. ARBITRAGE GAP (ULTRA LOOSE THRESHOLD)
    double buy_gap = (b_bid - m_ask) / m_ask * 10000.0;
    double sell_gap = (m_bid - b_ask) / b_ask * 10000.0;
 
-   // 4. EXECUTE[cite: 1, 2]
+   // 4. OPEN TRADES ON SMALLEST GAP (MinGap_BPS = 0)
    if(buy_gap > (MinGap_BPS + Fee_BPS)) {
       double lot = (AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0) * (RiskPercent/2.0) * 0.2;
-      if(trade.Buy(lot, _Symbol, m_ask, 0, 0, "Sonic Buy"))
-         PrintFormat("🔥 DEBUG: BUY OPEN | Gap: %.2f | Price: %.2f", buy_gap, m_ask);
+      if(trade.Buy(lot, _Symbol, m_ask, 0, 0, "Sonic Buy (Loose)"))
+         PrintFormat("🔥 BUY OPEN | Gap: %.2f bps | Price: %.2f", buy_gap, m_ask);
    }
    else if(sell_gap > (MinGap_BPS + Fee_BPS)) {
       double lot = (AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0) * (RiskPercent/2.0) * 0.2;
-      if(trade.Sell(lot, _Symbol, m_bid, 0, 0, "Sonic Sell"))
-         PrintFormat("🔥 DEBUG: SELL OPEN | Gap: %.2f | Price: %.2f", sell_gap, m_bid);
+      if(trade.Sell(lot, _Symbol, m_bid, 0, 0, "Sonic Sell (Loose)"))
+         PrintFormat("🔥 SELL OPEN | Gap: %.2f bps | Price: %.2f", sell_gap, m_bid);
    }
 }
 
