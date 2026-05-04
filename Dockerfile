@@ -20,35 +20,32 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                    TrendFilteredArbitrageV25.mq5|
-//|                     Only trades with trend, dynamic threshold   |
+//|                                    TrendFilteredArbitrageV26.mq5|
+//|                     Fixed iMA + more aggressive entry           |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
-#property copyright "Omni-Apex V25.0"
-#property version   "25.00"
+#property copyright "Omni-Apex V26.0"
+#property version   "26.00"
 #property strict
 
-// --- INPUTS --------------------------------------------------------+
+// --- INPUTS (adjust for your asset) ----------------------------------+
 input string BinanceSymbol               = "ETHUSDT";
 input double RiskPercent                 = 2.0;          // % equity per trade
-input int    MA_Period                   = 200;          // Trend filter period
-input ENUM_TIMEFRAMES TrendTimeframe     = PERIOD_H1;    // Trend timeframe
-input double ATR_Multiplier              = 0.5;          // Min difference = ATR * this
-input int    ATR_Period                  = 14;           // ATR period for threshold
-input int    MaxOpenPositions            = 2;            // Only 2 positions max
-input int    MagicNumber                 = 999025;
-input int    TradeCooldownSeconds        = 5;            // Seconds between trades
+input int    MAPeriod                    = 200;          // EMA period for trend
+input ENUM_TIMEFRAMES TrendTF            = PERIOD_H1;    // Trend timeframe
+input double MinGapPoints                = 50;           // Minimum price difference in points (no ATR)
+input int    MaxOpenPositions            = 2;
+input int    MagicNumber                 = 999026;
+input int    TradeCooldownSeconds        = 5;
 
 // --- GLOBALS -------------------------------------------------------+
 CTrade trade;
 string binance_url;
-datetime last_debug_time = 0;
-datetime last_trade_time = 0;
-int atr_handle;
-double atr_buffer[];
+datetime last_debug = 0;
+datetime last_trade = 0;
+int ma_handle;
 double ma_buffer[];
-double point;
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                           |
@@ -58,46 +55,38 @@ int OnInit() {
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
    SymbolSelect(_Symbol, true);
-   point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    
-   // Initialize trend indicators
-   atr_handle = iATR(_Symbol, TrendTimeframe, ATR_Period);
-   if(atr_handle == INVALID_HANDLE) {
-      Print("Failed to create ATR handle");
+   // Create MA handle (correct way)
+   ma_handle = iMA(_Symbol, TrendTF, MAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   if(ma_handle == INVALID_HANDLE) {
+      Print("Failed to create MA handle, error: ", GetLastError());
       return INIT_FAILED;
    }
-   ArraySetAsSeries(atr_buffer, true);
+   ArraySetAsSeries(ma_buffer, true);
    
    Print("==============================================");
-   Print("🟢 TREND-FILTERED ARBITRAGE EA V25.0");
+   Print("🟢 TREND-FILTERED ARBITRAGE V26");
    Print("   Binance: ", BinanceSymbol, " | MT5: ", _Symbol);
-   Print("   Trend filter: MA(", MA_Period, ") on ", EnumToString(TrendTimeframe));
-   Print("   Min gap: ", ATR_Multiplier, " x ATR");
+   Print("   Trend EMA(", MAPeriod, ") on ", EnumToString(TrendTF));
+   Print("   Min gap: ", MinGapPoints, " points");
    Print("==============================================");
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
-//| Helper: Get current trend direction (1 = up, -1 = down, 0 = flat)|
+//| Get current trend (1=up, -1=down, 0=flat/bad data)             |
 //+------------------------------------------------------------------+
 int GetTrend() {
-   double ma_current = iMA(_Symbol, TrendTimeframe, MA_Period, 0, MODE_EMA, PRICE_CLOSE, 0);
+   if(CopyBuffer(ma_handle, 0, 0, 1, ma_buffer) < 1) return 0;
+   double ma_value = ma_buffer[0];
    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   if(price > ma_current) return 1;
-   if(price < ma_current) return -1;
+   if(price > ma_value) return 1;
+   if(price < ma_value) return -1;
    return 0;
 }
 
 //+------------------------------------------------------------------+
-//| Helper: Get current ATR value in points                         |
-//+------------------------------------------------------------------+
-double GetATR_Points() {
-   if(CopyBuffer(atr_handle, 0, 0, 1, atr_buffer) < 1) return 0;
-   return atr_buffer[0] / point;
-}
-
-//+------------------------------------------------------------------+
-//| Helper: Get Binance mid price                                    |
+//| Get Binance mid price                                           |
 //+------------------------------------------------------------------+
 double GetBinanceMid() {
    char post[], result[];
@@ -106,7 +95,7 @@ double GetBinanceMid() {
    if(res <= 0) return -1;
    string resp = CharArrayToString(result);
    
-   // Simple extraction
+   // Parse JSON manually
    int bidPos = StringFind(resp, "\"bidPrice\":\"");
    int askPos = StringFind(resp, "\"askPrice\":\"");
    if(bidPos < 0 || askPos < 0) return -1;
@@ -123,24 +112,24 @@ double GetBinanceMid() {
 }
 
 //+------------------------------------------------------------------+
-//| Expert tick function                                             |
+//| Expert tick function                                            |
 //+------------------------------------------------------------------+
 void OnTick() {
-   // 1. Fast exit on profit
+   // 1. Close profitable positions immediately
    for(int i = PositionsTotal()-1; i >= 0; i--) {
       ulong ticket = PositionGetTicket(i);
       if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
          double profit = PositionGetDouble(POSITION_PROFIT);
          if(profit > 0.0) {
             if(trade.PositionClose(ticket))
-               Print("✅ [CLOSE] Profit: ", profit);
+               Print("✅ [CLOSE] Ticket ", ticket, " profit: ", profit);
          }
       }
    }
    
-   // 2. Position limit & cooldown
+   // 2. Limits
    if(PositionsTotal() >= MaxOpenPositions) return;
-   if(TimeCurrent() - last_trade_time < TradeCooldownSeconds) return;
+   if(TimeCurrent() - last_trade < TradeCooldownSeconds) return;
    
    // 3. Get MT5 prices
    double mt5_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
@@ -148,54 +137,53 @@ void OnTick() {
    if(mt5_ask <= 0 || mt5_bid <= 0) return;
    double mt5_mid = (mt5_ask + mt5_bid) / 2.0;
    
-   // 4. Get Binance price
+   // 4. Get Binance mid
    double binance_mid = GetBinanceMid();
    if(binance_mid <= 0) return;
    
-   // 5. Calculate difference in points
-   double diff_points = (binance_mid - mt5_mid) / point;
+   // 5. Difference in points
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double diff_pts = (binance_mid - mt5_mid) / point;
    
-   // 6. Get trend and dynamic threshold
+   // 6. Get trend
    int trend = GetTrend();
-   double atr_points = GetATR_Points();
-   double minGap = atr_points * ATR_Multiplier;
-   if(minGap < 10) minGap = 10;  // absolute minimum 10 points
    
    // 7. Debug every 10 seconds
-   if(TimeCurrent() - last_debug_time >= 10) {
-      last_debug_time = TimeCurrent();
+   if(TimeCurrent() - last_debug >= 10) {
+      last_debug = TimeCurrent();
       Print("========================================");
       Print("📊 MT5 Mid: ", DoubleToString(mt5_mid, _Digits));
       Print("📊 Binance Mid: ", DoubleToString(binance_mid, _Digits));
-      Print("📊 Diff: ", DoubleToString(diff_points, 0), " pts");
-      Print("📊 Trend: ", trend == 1 ? "UP" : (trend == -1 ? "DOWN" : "FLAT"));
-      Print("📊 Min Gap required: ", DoubleToString(minGap, 0), " pts (ATR=", DoubleToString(atr_points, 0), ")");
+      Print("📊 Diff: ", DoubleToString(diff_pts, 0), " pts");
+      Print("📊 Trend: ", trend == 1 ? "UP" : (trend == -1 ? "DOWN" : "UNKNOWN"));
+      Print("📊 Min gap required: ", MinGapPoints);
       Print("========================================");
    }
    
-   // 8. Determine signal with trend filter + threshold
-   bool buy_signal = (trend == 1) && (diff_points > minGap);
-   bool sell_signal = (trend == -1) && (diff_points < -minGap);
+   // 8. Signal: trend aligned + difference exceeds threshold
+   bool buy_signal = (trend == 1) && (diff_pts > MinGapPoints);
+   bool sell_signal = (trend == -1) && (diff_pts < -MinGapPoints);
    
    if(!buy_signal && !sell_signal) return;
    
-   // 9. Open trade (NO STOP LOSS)
+   // 9. Position sizing
    double lot = NormalizeDouble(AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPercent / 100.0), 2);
    lot = MathMax(0.01, lot);
    lot = MathMin(lot, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX));
    
+   // 10. Execute (no stop loss)
    if(buy_signal) {
-      if(trade.Buy(lot, _Symbol, mt5_ask, 0, 0, "Trend Arb Buy")) {
-         Print("🔥 [BUY] Diff: ", diff_points, " pts | Lot: ", lot);
-         last_trade_time = TimeCurrent();
+      if(trade.Buy(lot, _Symbol, mt5_ask, 0, 0, "Trend Buy")) {
+         Print("🔥 [BUY] Diff: ", diff_pts, " pts | Lot: ", lot);
+         last_trade = TimeCurrent();
       } else {
          Print("❌ [BUY FAIL] Error: ", GetLastError());
       }
    }
    else if(sell_signal) {
-      if(trade.Sell(lot, _Symbol, mt5_bid, 0, 0, "Trend Arb Sell")) {
-         Print("🔥 [SELL] Diff: ", diff_points, " pts | Lot: ", lot);
-         last_trade_time = TimeCurrent();
+      if(trade.Sell(lot, _Symbol, mt5_bid, 0, 0, "Trend Sell")) {
+         Print("🔥 [SELL] Diff: ", diff_pts, " pts | Lot: ", lot);
+         last_trade = TimeCurrent();
       } else {
          Print("❌ [SELL FAIL] Error: ", GetLastError());
       }
@@ -203,10 +191,10 @@ void OnTick() {
 }
 
 //+------------------------------------------------------------------+
-//| Deinitialization                                                |
+//| Cleanup                                                         |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason) {
-   IndicatorRelease(atr_handle);
+   IndicatorRelease(ma_handle);
 }
 
 EOF
