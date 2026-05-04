@@ -19,34 +19,23 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # V16.3 - PROFIT-MAX VELOCITY BOT (ULTRA PROFITABILITY)
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
-//+------------------------------------------------------------------+
-//|                                      ArbitrageFastProfitV23.mq5 |
-//|                     Fast profit exit + hard stop loss + drawdown |
-//+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
-#property copyright "Omni-Apex V23.0"
-#property version   "23.00"
+#property copyright "Omni-Apex V22.0"
+#property version   "22.00"
 #property strict
 
-// --- INPUTS --------------------------------------------------------+
-input string BinanceSymbol               = "BTCUSDT";
-input double RiskPercent                 = 5.0;       // % of equity per trade (position size)
-input int    MinDiff_Points              = 0;         // Any difference triggers (0 = ultra loose)
-input int    MaxOpenPositions            = 5;         // Reduced from 30 to avoid stacking
-input int    MagicNumber                 = 999023;
-input int    StopLossPoints              = 200;       // Fixed stop loss in points (e.g., 200 points = 2.00 for ETHUSD)
-input double MaxTotalFloatingLossPercent = 10.0;      // If total floating loss exceeds X% of equity, close all and stop
-input int    MaxConsecutiveLosses        = 3;         // Stop new trades after N consecutive losses
-input int    TradeCooldownSeconds        = 2;         // Minimum seconds between new trades
+// --- INPUTS (ultra loose)
+input string BinanceSymbol     = "BTCUSDT";
+input double RiskPercent       = 5.0;       // % of equity per trade
+input int    MinDiff_Points    = 0;         // Any price difference triggers trade
+input int    MaxOpenPositions  = 30;
+input int    MagicNumber       = 999022;
 
-// --- GLOBALS -------------------------------------------------------+
+// --- GLOBALS
 CTrade trade;
 string binance_url;
 datetime last_debug_time = 0;
-datetime last_trade_time = 0;
-int consecutiveLosses = 0;
-bool emergencyClosed = false;
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                           |
@@ -56,12 +45,12 @@ int OnInit() {
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
    SymbolSelect(_Symbol, true);
+   
    Print("==============================================");
-   Print("🟢 EA V23.0 - ARBITRAGE WITH RISK CONTROLS");
-   Print("   Binance: ", BinanceSymbol, " | MT5: ", _Symbol);
-   Print("   StopLoss: ", StopLossPoints, " points");
-   Print("   Max Floating Loss: ", MaxTotalFloatingLossPercent, "%");
-   Print("   Max Consecutive Losses: ", MaxConsecutiveLosses);
+   Print("🟢 EA V22.0 - FORCE TRADE ON ANY PRICE DIFFERENCE");
+   Print("   Binance Symbol: ", BinanceSymbol);
+   Print("   MT5 Symbol: ", _Symbol);
+   Print("   MinDiff_Points: ", MinDiff_Points, " (any difference > 0 opens trade)");
    Print("==============================================");
    return(INIT_SUCCEEDED);
 }
@@ -84,13 +73,7 @@ double GetJsonDouble(string text, string key) {
 //| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick() {
-   // 1. EMERGENCY: if EA is disabled due to drawdown, do nothing
-   if(emergencyClosed) {
-      Print("⚠️ EA disabled due to excessive drawdown. Restart required.");
-      return;
-   }
-   
-   // 2. CLOSE ANY POSITION WITH POSITIVE PROFIT (FAST OUT)
+   // --- 1. CLOSE ANY POSITION WITH POSITIVE PROFIT (FAST OUT) ---
    for(int i = PositionsTotal()-1; i >= 0; i--) {
       ulong ticket = PositionGetTicket(i);
       if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
@@ -98,8 +81,6 @@ void OnTick() {
          if(profit > 0.0) {
             if(trade.PositionClose(ticket)) {
                Print("✅ [CLOSE] Ticket ", ticket, " closed with profit: ", profit);
-               // Reset consecutive loss counter on win
-               consecutiveLosses = 0;
             } else {
                Print("❌ [CLOSE] Failed, error: ", GetLastError());
             }
@@ -107,44 +88,79 @@ void OnTick() {
       }
    }
    
-   // 3. CHECK TOTAL FLOATING LOSS
-   double totalFloatingLoss = 0.0;
-   for(int i = PositionsTotal()-1; i >= 0; i--) {
-      ulong ticket = PositionGetTicket(i);
-      if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
-         totalFloatingLoss += PositionGetDouble(POSITION_PROFIT);
-      }
-   }
-   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double lossPercent = -totalFloatingLoss / equity * 100.0;
-   if(totalFloatingLoss < 0 && lossPercent > MaxTotalFloatingLossPercent) {
-      Print("🚨 EMERGENCY: Total floating loss ", lossPercent, "% exceeds ", MaxTotalFloatingLossPercent, "%. Closing all positions.");
-      for(int i = PositionsTotal()-1; i >= 0; i--) {
-         ulong ticket = PositionGetTicket(i);
-         if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
-            trade.PositionClose(ticket);
-         }
-      }
-      emergencyClosed = true;
+   // --- 2. POSITION LIMIT ---
+   if(PositionsTotal() >= MaxOpenPositions) {
+      static int throttle = 0;
+      if(throttle++ % 100 == 0) Print("⚠️ Max positions reached: ", PositionsTotal());
       return;
    }
    
-   // 4. STOP TRADING IF TOO MANY CONSECUTIVE LOSSES
-   if(consecutiveLosses >= MaxConsecutiveLosses) {
-      static int warn = 0;
-      if(warn++ % 100 == 0) Print("⛔ Trading stopped due to ", consecutiveLosses, " consecutive losses. Restart EA to resume.");
-      return;
-   }
-   
-   // 5. POSITION LIMIT & COOLDOWN
-   if(PositionsTotal() >= MaxOpenPositions) return;
-   if(TimeCurrent() - last_trade_time < TradeCooldownSeconds) return;
-   
-   // 6. GET MT5 PRICES
+   // --- 3. GET MT5 PRICES ---
    double mt5_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double mt5_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   if(mt5_ask <= 0 || mt5_bid <= 0) return;
+   if(mt5_ask <= 0 || mt5_bid <= 0) {
+      Print("❌ MT5 price error");
+      return;
+   }
    double mt5_mid = (mt5_ask + mt5_bid) / 2.0;
+   
+   // --- 4. FETCH BINANCE PRICES ---
+   char post[], result[];
+   string headers;
+   int res = WebRequest("GET", binance_url, NULL, NULL, 5000, post, 0, result, headers);
+   if(res <= 0) {
+      Print("❌ WebRequest failed. Error: ", GetLastError());
+      return;
+   }
+   
+   string resp = CharArrayToString(result);
+   double binance_bid = GetJsonDouble(resp, "\"bidPrice\":\"");
+   double binance_ask = GetJsonDouble(resp, "\"askPrice\":\"");
+   if(binance_bid <= 0 || binance_ask <= 0) {
+      Print("❌ Binance parse error. Response: ", StringSubstr(resp, 0, 200));
+      return;
+   }
+   double binance_mid = (binance_ask + binance_bid) / 2.0;
+   
+   // --- 5. CALCULATE DIFFERENCE (in points) ---
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double diff_points = (binance_mid - mt5_mid) / point;
+   bool buy_signal = (diff_points > MinDiff_Points);
+   bool sell_signal = (diff_points < -MinDiff_Points);
+   
+   // --- 6. DEBUG OUTPUT (every 5 seconds) ---
+   if(TimeCurrent() - last_debug_time >= 5) {
+      last_debug_time = TimeCurrent();
+      Print("========================================");
+      Print("📊 MT5   Ask: ", DoubleToString(mt5_ask, _Digits), "  Bid: ", DoubleToString(mt5_bid, _Digits));
+      Print("📊 Binance Ask: ", DoubleToString(binance_ask, _Digits), " Bid: ", DoubleToString(binance_bid, _Digits));
+      Print("📊 MT5 Mid: ", DoubleToString(mt5_mid, _Digits));
+      Print("📊 Binance Mid: ", DoubleToString(binance_mid, _Digits));
+      Print("📊 Difference: ", DoubleToString(diff_points, 2), " points");
+      Print("📊 Buy signal: ", buy_signal ? "YES" : "NO", " | Sell signal: ", sell_signal ? "YES" : "NO");
+      Print("========================================");
+   }
+   
+   // --- 7. OPEN TRADE ON ANY DIFFERENCE ---
+   double lot = NormalizeDouble(AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPercent / 100.0), 2);
+   lot = MathMax(0.01, lot);
+   
+   if(buy_signal) {
+      if(trade.Buy(lot, _Symbol, mt5_ask, 0, 0, "Force Buy")) {
+         Print("🔥 [BUY OPEN] Diff: ", diff_points, " points | Lot: ", lot, " @ ", mt5_ask);
+      } else {
+         Print("❌ [BUY FAIL] Error: ", GetLastError());
+      }
+   }
+   else if(sell_signal) {
+      if(trade.Sell(lot, _Symbol, mt5_bid, 0, 0, "Force Sell")) {
+         Print("🔥 [SELL OPEN] Diff: ", diff_points, " points | Lot: ", lot, " @ ", mt5_bid);
+      } else {
+         Print("❌ [SELL FAIL] Error: ", GetLastError());
+      }
+   }
+}
+/ 2.0;
    
    // 7. FETCH BINANCE PRICES
    char post[], result[];
