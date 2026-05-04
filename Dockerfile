@@ -19,23 +19,36 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # V16.3 - PROFIT-MAX VELOCITY BOT (ULTRA PROFITABILITY)
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
+//+------------------------------------------------------------------+
+//|                                    TrendFilteredArbitrageV25.mq5|
+//|                     Only trades with trend, dynamic threshold   |
+//+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
-#property copyright "Omni-Apex V22.0"
-#property version   "22.00"
+#property copyright "Omni-Apex V25.0"
+#property version   "25.00"
 #property strict
 
-// --- INPUTS (ultra loose)
-input string BinanceSymbol     = "BTCUSDT";
-input double RiskPercent       = 5.0;       // % of equity per trade
-input int    MinDiff_Points    = 0;         // Any price difference triggers trade
-input int    MaxOpenPositions  = 30;
-input int    MagicNumber       = 999022;
+// --- INPUTS --------------------------------------------------------+
+input string BinanceSymbol               = "ETHUSDT";
+input double RiskPercent                 = 2.0;          // % equity per trade
+input int    MA_Period                   = 200;          // Trend filter period
+input ENUM_TIMEFRAMES TrendTimeframe     = PERIOD_H1;    // Trend timeframe
+input double ATR_Multiplier              = 0.5;          // Min difference = ATR * this
+input int    ATR_Period                  = 14;           // ATR period for threshold
+input int    MaxOpenPositions            = 2;            // Only 2 positions max
+input int    MagicNumber                 = 999025;
+input int    TradeCooldownSeconds        = 5;            // Seconds between trades
 
-// --- GLOBALS
+// --- GLOBALS -------------------------------------------------------+
 CTrade trade;
 string binance_url;
 datetime last_debug_time = 0;
+datetime last_trade_time = 0;
+int atr_handle;
+double atr_buffer[];
+double ma_buffer[];
+double point;
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                           |
@@ -45,122 +58,156 @@ int OnInit() {
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
    SymbolSelect(_Symbol, true);
+   point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   
+   // Initialize trend indicators
+   atr_handle = iATR(_Symbol, TrendTimeframe, ATR_Period);
+   if(atr_handle == INVALID_HANDLE) {
+      Print("Failed to create ATR handle");
+      return INIT_FAILED;
+   }
+   ArraySetAsSeries(atr_buffer, true);
    
    Print("==============================================");
-   Print("🟢 EA V22.0 - FORCE TRADE ON ANY PRICE DIFFERENCE");
-   Print("   Binance Symbol: ", BinanceSymbol);
-   Print("   MT5 Symbol: ", _Symbol);
-   Print("   MinDiff_Points: ", MinDiff_Points, " (any difference > 0 opens trade)");
+   Print("🟢 TREND-FILTERED ARBITRAGE EA V25.0");
+   Print("   Binance: ", BinanceSymbol, " | MT5: ", _Symbol);
+   Print("   Trend filter: MA(", MA_Period, ") on ", EnumToString(TrendTimeframe));
+   Print("   Min gap: ", ATR_Multiplier, " x ATR");
    Print("==============================================");
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
-//| Helper: Extract double from JSON                                 |
+//| Helper: Get current trend direction (1 = up, -1 = down, 0 = flat)|
 //+------------------------------------------------------------------+
-double GetJsonDouble(string text, string key) {
-   int pos = StringFind(text, key);
-   if(pos == -1) return -1;
-   int start = pos + StringLen(key);
-   int end = StringFind(text, "\"", start);
-   if(end == -1) end = StringFind(text, ",", start);
-   if(end == -1) end = StringLen(text);
-   string substr = StringSubstr(text, start, end - start);
-   return StringToDouble(substr);
+int GetTrend() {
+   double ma_current = iMA(_Symbol, TrendTimeframe, MA_Period, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(price > ma_current) return 1;
+   if(price < ma_current) return -1;
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+//| Helper: Get current ATR value in points                         |
+//+------------------------------------------------------------------+
+double GetATR_Points() {
+   if(CopyBuffer(atr_handle, 0, 0, 1, atr_buffer) < 1) return 0;
+   return atr_buffer[0] / point;
+}
+
+//+------------------------------------------------------------------+
+//| Helper: Get Binance mid price                                    |
+//+------------------------------------------------------------------+
+double GetBinanceMid() {
+   char post[], result[];
+   string headers;
+   int res = WebRequest("GET", binance_url, NULL, NULL, 5000, post, 0, result, headers);
+   if(res <= 0) return -1;
+   string resp = CharArrayToString(result);
+   
+   // Simple extraction
+   int bidPos = StringFind(resp, "\"bidPrice\":\"");
+   int askPos = StringFind(resp, "\"askPrice\":\"");
+   if(bidPos < 0 || askPos < 0) return -1;
+   
+   int bidStart = bidPos + 11;
+   int bidEnd = StringFind(resp, "\"", bidStart);
+   double bid = StringToDouble(StringSubstr(resp, bidStart, bidEnd - bidStart));
+   
+   int askStart = askPos + 11;
+   int askEnd = StringFind(resp, "\"", askStart);
+   double ask = StringToDouble(StringSubstr(resp, askStart, askEnd - askStart));
+   
+   return (ask + bid) / 2.0;
 }
 
 //+------------------------------------------------------------------+
 //| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick() {
-   // --- 1. CLOSE ANY POSITION WITH POSITIVE PROFIT (FAST OUT) ---
+   // 1. Fast exit on profit
    for(int i = PositionsTotal()-1; i >= 0; i--) {
       ulong ticket = PositionGetTicket(i);
       if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
          double profit = PositionGetDouble(POSITION_PROFIT);
          if(profit > 0.0) {
-            if(trade.PositionClose(ticket)) {
-               Print("✅ [CLOSE] Ticket ", ticket, " closed with profit: ", profit);
-            } else {
-               Print("❌ [CLOSE] Failed, error: ", GetLastError());
-            }
+            if(trade.PositionClose(ticket))
+               Print("✅ [CLOSE] Profit: ", profit);
          }
       }
    }
    
-   // --- 2. POSITION LIMIT ---
-   if(PositionsTotal() >= MaxOpenPositions) {
-      static int throttle = 0;
-      if(throttle++ % 100 == 0) Print("⚠️ Max positions reached: ", PositionsTotal());
-      return;
-   }
+   // 2. Position limit & cooldown
+   if(PositionsTotal() >= MaxOpenPositions) return;
+   if(TimeCurrent() - last_trade_time < TradeCooldownSeconds) return;
    
-   // --- 3. GET MT5 PRICES ---
+   // 3. Get MT5 prices
    double mt5_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double mt5_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   if(mt5_ask <= 0 || mt5_bid <= 0) {
-      Print("❌ MT5 price error");
-      return;
-   }
+   if(mt5_ask <= 0 || mt5_bid <= 0) return;
    double mt5_mid = (mt5_ask + mt5_bid) / 2.0;
    
-   // --- 4. FETCH BINANCE PRICES ---
-   char post[], result[];
-   string headers;
-   int res = WebRequest("GET", binance_url, NULL, NULL, 5000, post, 0, result, headers);
-   if(res <= 0) {
-      Print("❌ WebRequest failed. Error: ", GetLastError());
-      return;
-   }
+   // 4. Get Binance price
+   double binance_mid = GetBinanceMid();
+   if(binance_mid <= 0) return;
    
-   string resp = CharArrayToString(result);
-   double binance_bid = GetJsonDouble(resp, "\"bidPrice\":\"");
-   double binance_ask = GetJsonDouble(resp, "\"askPrice\":\"");
-   if(binance_bid <= 0 || binance_ask <= 0) {
-      Print("❌ Binance parse error. Response: ", StringSubstr(resp, 0, 200));
-      return;
-   }
-   double binance_mid = (binance_ask + binance_bid) / 2.0;
-   
-   // --- 5. CALCULATE DIFFERENCE (in points) ---
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   // 5. Calculate difference in points
    double diff_points = (binance_mid - mt5_mid) / point;
-   bool buy_signal = (diff_points > MinDiff_Points);
-   bool sell_signal = (diff_points < -MinDiff_Points);
    
-   // --- 6. DEBUG OUTPUT (every 5 seconds) ---
-   if(TimeCurrent() - last_debug_time >= 5) {
+   // 6. Get trend and dynamic threshold
+   int trend = GetTrend();
+   double atr_points = GetATR_Points();
+   double minGap = atr_points * ATR_Multiplier;
+   if(minGap < 10) minGap = 10;  // absolute minimum 10 points
+   
+   // 7. Debug every 10 seconds
+   if(TimeCurrent() - last_debug_time >= 10) {
       last_debug_time = TimeCurrent();
       Print("========================================");
-      Print("📊 MT5   Ask: ", DoubleToString(mt5_ask, _Digits), "  Bid: ", DoubleToString(mt5_bid, _Digits));
-      Print("📊 Binance Ask: ", DoubleToString(binance_ask, _Digits), " Bid: ", DoubleToString(binance_bid, _Digits));
       Print("📊 MT5 Mid: ", DoubleToString(mt5_mid, _Digits));
       Print("📊 Binance Mid: ", DoubleToString(binance_mid, _Digits));
-      Print("📊 Difference: ", DoubleToString(diff_points, 2), " points");
-      Print("📊 Buy signal: ", buy_signal ? "YES" : "NO", " | Sell signal: ", sell_signal ? "YES" : "NO");
+      Print("📊 Diff: ", DoubleToString(diff_points, 0), " pts");
+      Print("📊 Trend: ", trend == 1 ? "UP" : (trend == -1 ? "DOWN" : "FLAT"));
+      Print("📊 Min Gap required: ", DoubleToString(minGap, 0), " pts (ATR=", DoubleToString(atr_points, 0), ")");
       Print("========================================");
    }
    
-   // --- 7. OPEN TRADE ON ANY DIFFERENCE ---
+   // 8. Determine signal with trend filter + threshold
+   bool buy_signal = (trend == 1) && (diff_points > minGap);
+   bool sell_signal = (trend == -1) && (diff_points < -minGap);
+   
+   if(!buy_signal && !sell_signal) return;
+   
+   // 9. Open trade (NO STOP LOSS)
    double lot = NormalizeDouble(AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPercent / 100.0), 2);
    lot = MathMax(0.01, lot);
+   lot = MathMin(lot, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX));
    
    if(buy_signal) {
-      if(trade.Buy(lot, _Symbol, mt5_ask, 0, 0, "Force Buy")) {
-         Print("🔥 [BUY OPEN] Diff: ", diff_points, " points | Lot: ", lot, " @ ", mt5_ask);
+      if(trade.Buy(lot, _Symbol, mt5_ask, 0, 0, "Trend Arb Buy")) {
+         Print("🔥 [BUY] Diff: ", diff_points, " pts | Lot: ", lot);
+         last_trade_time = TimeCurrent();
       } else {
          Print("❌ [BUY FAIL] Error: ", GetLastError());
       }
    }
    else if(sell_signal) {
-      if(trade.Sell(lot, _Symbol, mt5_bid, 0, 0, "Force Sell")) {
-         Print("🔥 [SELL OPEN] Diff: ", diff_points, " points | Lot: ", lot, " @ ", mt5_bid);
+      if(trade.Sell(lot, _Symbol, mt5_bid, 0, 0, "Trend Arb Sell")) {
+         Print("🔥 [SELL] Diff: ", diff_points, " pts | Lot: ", lot);
+         last_trade_time = TimeCurrent();
       } else {
          Print("❌ [SELL FAIL] Error: ", GetLastError());
       }
    }
 }
 
+//+------------------------------------------------------------------+
+//| Deinitialization                                                |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason) {
+   IndicatorRelease(atr_handle);
+}
 
 EOF
 
