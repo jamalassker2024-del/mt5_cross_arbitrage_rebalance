@@ -20,101 +20,97 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                            SMC_Scalper.mq5       |
-//|                          Smart Money Concepts Scalper for GOLD   |
-//|                              High Probability Entries on M1      |
+//|                                     Ultra_Aggressive_Tick_Scalper|
+//|                     Trades on every tick, high win rate pattern  |
+//|                              Target: $5/day on $10 cent account  |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalper"
-#property version   "1.00"
+#property copyright "Aggressive Scalper"
+#property version   "5.00"
 #property strict
 
 #include <Trade\Trade.mqh>
-#include <Math\Stat\Math.mqh> // For ATR-based volatility filter
 
-// --- Inputs (Configurable for your $10 cent account) ---
-input string   t1 = "==== Strategy Selection ====";
-input bool     ActivateOrderBlock     = true;   // Trade Order Blocks (High Win Rate)
-input bool     ActivateFairValueGap   = true;   // Trade Fair Value Gaps (High Win Rate)
-input bool     ActivateLiquiditySweep = true;   // Trade Liquidity Sweeps (High Win Rate)
+// === Inputs (Extremely Aggressive for $10 Cent) ===
+input string   t1 = "==== Money Management ====";
+input double   RiskPercent       = 15.0;       // 15% risk per trade (very aggressive)
+input int      StopLossPoints    = 60;         // 6 pips SL
+input int      TakeProfitPoints  = 30;         // 3 pips TP (tiny, for high win rate)
+input int      MaxConcurrentTrades = 2;        // Max positions at once
+input int      MagicNumber       = 777123;
 
-input string   t2 = "==== Money Management ====";
-input double   RiskPercent            = 12.0;   // Risk per trade (% of equity)
-input ENUM_LOT_MODE LotMode           = LOT_CENTS; // 0.01 per $10 balance for cent accounts
-input int      StopLossPoints         = 150;    // Stop Loss (15 pips)
-input int      TakeProfitPoints       = 200;    // Take Profit (20 pips)
-input int      MaxConcurrentTrades    = 2;      // Max positions at once
-input int      MagicNumber            = 887766;
+input string   t2 = "==== Tick Pattern ====";
+input int      ConsecutiveTicksNeeded = 3;     // Number of same-direction ticks to start
+input int      ReversalTicksRequired = 2;      // Opposite ticks to confirm reversal
+input int      MinTickMovementPoints = 2;      // Minimum price change per tick (filter noise)
 
-input string   t3 = "==== Filters / Daily Limits ====";
-input double   MaxDailyProfitUSD      = 5.0;    // Stop after $5 profit (500 cents)
-input double   MaxDailyLossUSD        = 1.0;    // Stop after $1 loss (100 cents)
-input int      MinATRPoints           = 50;     // Minimum volatility filter (5 pips)
-input int      MaxSpreadPoints        = 25;     // Max spread (2.5 pips)
+input string   t3 = "==== Aggressive Filters ====";
+input int      MaxSpreadPoints   = 30;         // Max 3 pips spread (lenient)
+input bool     UseTimeFilter     = true;       // Only trade during active sessions
+input int      StartHour         = 8;          // GMT (London open)
+input int      EndHour           = 20;         // GMT (NY close)
+input bool     UseTrailingStop   = true;
+input int      TrailingStartPts  = 15;         // Start trailing at 1.5 pips profit
+input int      TrailingStepPts   = 8;          // Trail by 0.8 pips
 
-// --- Globals ---
+input string   t4 = "==== Daily Limits ====";
+input double   DailyTargetUSD    = 5.0;        // Stop after $5 profit (500 cents)
+input double   MaxDailyLossUSD   = 2.0;        // Stop after $2 loss (200 cents)
+
+// === Globals ===
 CTrade trade;
-int      rsi_handle, atr_handle;
-double   rsi_buf[], atr_buf[];
-datetime lastBarTime = 0;
-double   dailyProfit = 0.0;
-double   startBalance = 0.0;
-bool     tradingHalted = false;
 datetime lastTradeTime = 0;
-int      consecutiveLosses = 0;
+double lastPrice = 0;
+int consecutiveUpTicks = 0;
+int consecutiveDownTicks = 0;
+int reversalCounter = 0;   // number of opposite ticks after a run
+bool waitingForReversal = false;
+bool lastDirectionUp = false;
+double dailyProfit = 0.0;
+double startBalance = 0.0;
+bool tradingHalted = false;
+int tradeCountToday = 0;
 
 //+------------------------------------------------------------------+
-//| Expert initialization function                                   |
+//| Expert initialization                                           |
 //+------------------------------------------------------------------+
 int OnInit() {
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetTypeFilling(ORDER_FILLING_FOK);
    startBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-
-   // Create indicators
-   rsi_handle = iRSI(_Symbol, PERIOD_M1, 7, PRICE_CLOSE);
-   atr_handle = iATR(_Symbol, PERIOD_M1, 14);
    
-   if(rsi_handle == INVALID_HANDLE || atr_handle == INVALID_HANDLE) {
-      Print("Error creating indicators");
-      return INIT_FAILED;
-   }
-   
-   ArraySetAsSeries(rsi_buf, true);
-   ArraySetAsSeries(atr_buf, true);
-   
-   Print("==================================================");
-   Print("✅ SMC SCALPER ACTIVATED for $10 Cent Account");
-   Print("   Strategies: OB=", ActivateOrderBlock, " FVG=", ActivateFairValueGap, " LS=", ActivateLiquiditySweep);
-   Print("   Target: $5/day | Risk: ", RiskPercent, "% of balance per trade");
-   Print("==================================================");
+   Print("==========================================");
+   Print("⚡ ULTRA AGGRESSIVE TICK SCALPER");
+   Print("   Balance: $", startBalance);
+   Print("   Risk per trade: ", RiskPercent, "%");
+   Print("   TP: 3 pips | SL: 6 pips");
+   Print("   Pattern: ", ConsecutiveTicksNeeded, " ticks one way + ", ReversalTicksRequired, " opposite = trade");
+   Print("   Daily target: $", DailyTargetUSD, " | Max loss: $", MaxDailyLossUSD);
+   Print("==========================================");
    
    return INIT_SUCCEEDED;
 }
 
 //+------------------------------------------------------------------+
-//| Deinitialization function                                        |
+//| Deinitialization                                                |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason) {
-   IndicatorRelease(rsi_handle);
-   IndicatorRelease(atr_handle);
-   Print("EA Stopped. Reason: ", reason);
+   Print("EA stopped. Trades today: ", tradeCountToday);
 }
 
 //+------------------------------------------------------------------+
-//| Tick function (Main logic for all strategies)                    |
+//| Tick function – runs on every price change                      |
 //+------------------------------------------------------------------+
 void OnTick() {
-   // --- Daily Limits Check (Protects your capital) ---
+   // --- Daily limits ---
    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    dailyProfit = currentBalance - startBalance;
-   
-   if(dailyProfit >= MaxDailyProfitUSD) {
-      if(!tradingHalted) Print("🎯 Daily target of $", MaxDailyProfitUSD, " reached. Trading halted.");
+   if(dailyProfit >= DailyTargetUSD) {
+      if(!tradingHalted) Print("🎯 Daily target reached: $", dailyProfit);
       tradingHalted = true;
       return;
    }
    if(dailyProfit <= -MaxDailyLossUSD) {
-      if(!tradingHalted) Print("💀 Max daily loss of $", MaxDailyLossUSD, " hit. Trading halted.");
+      if(!tradingHalted) Print("💀 Daily loss limit hit: $", dailyProfit);
       tradingHalted = true;
       return;
    }
@@ -129,20 +125,25 @@ void OnTick() {
          lastReset = midnight;
          tradingHalted = false;
          startBalance = currentBalance;
-         Print("🔄 New trading day - Resuming");
+         tradeCountToday = 0;
+         Print("🔄 New day - Resuming");
       }
       return;
    }
    
-   // --- Filters (Spread, Volatility) ---
+   // --- Time filter ---
+   if(UseTimeFilter) {
+      MqlDateTime dt;
+      TimeToStruct(TimeCurrent(), dt);
+      int hour = dt.hour;
+      if(hour < StartHour || hour > EndHour) return;
+   }
+   
+   // --- Spread filter ---
    int spread = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
    if(spread > MaxSpreadPoints) return;
    
-   CopyBuffer(atr_handle, 0, 0, 2, atr_buf);
-   double atrPoints = atr_buf[0] / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   if(atrPoints < MinATRPoints) return;
-   
-   // --- Count Open Positions ---
+   // --- Position limit ---
    int posCount = 0;
    for(int i = PositionsTotal()-1; i >= 0; i--) {
       ulong ticket = PositionGetTicket(i);
@@ -151,157 +152,106 @@ void OnTick() {
    }
    if(posCount >= MaxConcurrentTrades) return;
    
-   // --- Cooldown: prevent overtrading ---
-   if(TimeCurrent() - lastTradeTime < 15) return;
+   // --- Cooldown: avoid multiple trades in same second ---
+   if(TimeCurrent() - lastTradeTime < 1) return;
    
-   // === 1. ORDER BLOCK STRATEGY ===
-   if(ActivateOrderBlock) {
-      int limit = 30;
-      double high[], low[], close[], open[];
-      ArraySetAsSeries(high, true);
-      ArraySetAsSeries(low, true);
-      ArraySetAsSeries(close, true);
-      ArraySetAsSeries(open, true);
+   // --- Get current bid price (for sells) and ask (for buys) ---
+   double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   
+   // --- Track tick direction and magnitude ---
+   if(lastPrice != 0) {
+      double movePoints = (currentBid - lastPrice) / point;
       
-      CopyHigh(_Symbol, PERIOD_M1, 0, limit, high);
-      CopyLow(_Symbol, PERIOD_M1, 0, limit, low);
-      CopyClose(_Symbol, PERIOD_M1, 0, limit, close);
-      CopyOpen(_Symbol, PERIOD_M1, 0, limit, open);
-      
-      // Bullish OB detection
-      for(int i=2; i<limit-3; i++) {
-         if(close[i] > open[i] && close[i+1] < open[i+1] && high[i] < high[i-1] && close[i] > close[i+1]) {
-            double obHigh = high[i+1];
-            double entryPrice = obHigh + 2 * _Point;
-            double sl = entryPrice - StopLossPoints * _Point;
-            double tp = entryPrice + TakeProfitPoints * _Point;
-            entryPrice = NormalizeDouble(entryPrice, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-            sl = NormalizeDouble(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-            tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-            double lot = CalculateLotSize();
-            if(trade.Buy(lot, _Symbol, entryPrice, sl, tp, "OB Buy")) {
-               Print("🔥 BUY ORDER BLOCK TRIGGERED | Price=", entryPrice, " | Lot=", lot);
-               lastTradeTime = TimeCurrent();
-               return;
+      // Only count ticks with minimum movement (filter noise)
+      if(MathAbs(movePoints) >= MinTickMovementPoints) {
+         if(movePoints > 0) {
+            // Up tick
+            if(waitingForReversal && !lastDirectionUp) {
+               // We were in a down run, now an up tick → reversal count
+               reversalCounter++;
+            } else if(!waitingForReversal) {
+               // Start a new run
+               consecutiveDownTicks = 0;
+               consecutiveUpTicks++;
+               lastDirectionUp = true;
+            }
+         } else if(movePoints < 0) {
+            // Down tick
+            if(waitingForReversal && lastDirectionUp) {
+               reversalCounter++;
+            } else if(!waitingForReversal) {
+               consecutiveUpTicks = 0;
+               consecutiveDownTicks++;
+               lastDirectionUp = false;
             }
          }
       }
       
-      // Bearish OB detection
-      for(int i=2; i<limit-3; i++) {
-         if(close[i] < open[i] && close[i+1] > open[i+1] && low[i] > low[i-1] && close[i] < close[i+1]) {
-            double obLow = low[i+1];
-            double entryPrice = obLow - 2 * _Point;
-            double sl = entryPrice + StopLossPoints * _Point;
-            double tp = entryPrice - TakeProfitPoints * _Point;
-            entryPrice = NormalizeDouble(entryPrice, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-            sl = NormalizeDouble(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-            tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+      // Check if we have enough consecutive ticks to start waiting for reversal
+      if(!waitingForReversal && (consecutiveUpTicks >= ConsecutiveTicksNeeded || consecutiveDownTicks >= ConsecutiveTicksNeeded)) {
+         waitingForReversal = true;
+         reversalCounter = 0;
+      }
+      
+      // If waiting for reversal and we got enough opposite ticks → trade signal
+      if(waitingForReversal && reversalCounter >= ReversalTicksRequired) {
+         // Determine direction
+         bool buySignal = (consecutiveDownTicks >= ConsecutiveTicksNeeded);  // down run then up reversal = buy
+         bool sellSignal = (consecutiveUpTicks >= ConsecutiveTicksNeeded);   // up run then down reversal = sell
+         
+         if(buySignal || sellSignal) {
             double lot = CalculateLotSize();
-            if(trade.Sell(lot, _Symbol, entryPrice, sl, tp, "OB Sell")) {
-               Print("🔥 SELL ORDER BLOCK TRIGGERED | Price=", entryPrice, " | Lot=", lot);
-               lastTradeTime = TimeCurrent();
-               return;
+            lot = MathMax(0.01, lot);
+            
+            if(buySignal) {
+               double entry = currentAsk;
+               double sl = entry - StopLossPoints * point;
+               double tp = entry + TakeProfitPoints * point;
+               sl = NormalizeDouble(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+               tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+               if(trade.Buy(lot, _Symbol, entry, sl, tp, "TickRevBuy")) {
+                  Print("🔥 BUY | Run: ", consecutiveDownTicks, " down ticks → ", reversalCounter, " up ticks | Lot=", lot);
+                  lastTradeTime = TimeCurrent();
+                  tradeCountToday++;
+                  ResetPatternCounters();
+               }
+            } else if(sellSignal) {
+               double entry = currentBid;
+               double sl = entry + StopLossPoints * point;
+               double tp = entry - TakeProfitPoints * point;
+               sl = NormalizeDouble(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+               tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+               if(trade.Sell(lot, _Symbol, entry, sl, tp, "TickRevSell")) {
+                  Print("🔥 SELL | Run: ", consecutiveUpTicks, " up ticks → ", reversalCounter, " down ticks | Lot=", lot);
+                  lastTradeTime = TimeCurrent();
+                  tradeCountToday++;
+                  ResetPatternCounters();
+               }
             }
          }
       }
    }
    
-   // === 2. FAIR VALUE GAP (FVG) STRATEGY ===
-   if(ActivateFairValueGap) {
-      int limit = 30;
-      double high[], low[];
-      ArraySetAsSeries(high, true);
-      ArraySetAsSeries(low, true);
-      CopyHigh(_Symbol, PERIOD_M1, 0, limit, high);
-      CopyLow(_Symbol, PERIOD_M1, 0, limit, low);
-      
-      // Bullish FVG: Candle 2 low > Candle 1 high
-      for(int i=2; i<limit-3; i++) {
-         if(low[i] > high[i+1]) {
-            double entryPrice = low[i] - 2 * _Point;
-            double sl = entryPrice - StopLossPoints * _Point;
-            double tp = entryPrice + TakeProfitPoints * _Point;
-            entryPrice = NormalizeDouble(entryPrice, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-            sl = NormalizeDouble(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-            tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-            double lot = CalculateLotSize();
-            if(trade.Buy(lot, _Symbol, entryPrice, sl, tp, "FVG Buy")) {
-               Print("🔥 BUY FAIR VALUE GAP TRIGGERED | Price=", entryPrice, " | Lot=", lot);
-               lastTradeTime = TimeCurrent();
-               return;
-            }
-         }
-      }
-      
-      // Bearish FVG: Candle 2 high < Candle 1 low
-      for(int i=2; i<limit-3; i++) {
-         if(high[i] < low[i+1]) {
-            double entryPrice = high[i] + 2 * _Point;
-            double sl = entryPrice + StopLossPoints * _Point;
-            double tp = entryPrice - TakeProfitPoints * _Point;
-            entryPrice = NormalizeDouble(entryPrice, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-            sl = NormalizeDouble(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-            tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-            double lot = CalculateLotSize();
-            if(trade.Sell(lot, _Symbol, entryPrice, sl, tp, "FVG Sell")) {
-               Print("🔥 SELL FAIR VALUE GAP TRIGGERED | Price=", entryPrice, " | Lot=", lot);
-               lastTradeTime = TimeCurrent();
-               return;
-            }
-         }
-      }
-   }
+   lastPrice = currentBid;
    
-   // === 3. LIQUIDITY SWEEP STRATEGY ===
-   if(ActivateLiquiditySweep) {
-      int limit = 20;
-      double high[], low[], close[];
-      ArraySetAsSeries(high, true);
-      ArraySetAsSeries(low, true);
-      ArraySetAsSeries(close, true);
-      CopyHigh(_Symbol, PERIOD_M1, 0, limit, high);
-      CopyLow(_Symbol, PERIOD_M1, 0, limit, low);
-      CopyClose(_Symbol, PERIOD_M1, 0, limit, close);
-      
-      // Bullish Sweep: Price trades below a recent low, then closes back above it
-      double recentLow = low[ArrayMinimum(low, 1, 10)];
-      if(close[0] > recentLow && low[0] < recentLow) {
-         double entryPrice = recentLow + 2 * _Point;
-         double sl = entryPrice - StopLossPoints * _Point;
-         double tp = entryPrice + TakeProfitPoints * _Point;
-         entryPrice = NormalizeDouble(entryPrice, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-         sl = NormalizeDouble(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-         tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-         double lot = CalculateLotSize();
-         if(trade.Buy(lot, _Symbol, entryPrice, sl, tp, "LiqSweep Buy")) {
-            Print("🔥 BUY LIQUIDITY SWEEP TRIGGERED | Price=", entryPrice, " | Lot=", lot);
-            lastTradeTime = TimeCurrent();
-            return;
-         }
-      }
-      
-      // Bearish Sweep: Price trades above a recent high, then closes back below it
-      double recentHigh = high[ArrayMaximum(high, 1, 10)];
-      if(close[0] < recentHigh && high[0] > recentHigh) {
-         double entryPrice = recentHigh - 2 * _Point;
-         double sl = entryPrice + StopLossPoints * _Point;
-         double tp = entryPrice - TakeProfitPoints * _Point;
-         entryPrice = NormalizeDouble(entryPrice, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-         sl = NormalizeDouble(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-         tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-         double lot = CalculateLotSize();
-         if(trade.Sell(lot, _Symbol, entryPrice, sl, tp, "LiqSweep Sell")) {
-            Print("🔥 SELL LIQUIDITY SWEEP TRIGGERED | Price=", entryPrice, " | Lot=", lot);
-            lastTradeTime = TimeCurrent();
-            return;
-         }
-      }
-   }
+   // --- Apply trailing stop to existing positions ---
+   if(UseTrailingStop) ApplyTrailingStop();
 }
 
 //+------------------------------------------------------------------+
-//| Calculate Lot Size (For Cent Accounts)                         |
+//| Reset pattern counters after trade                              |
+//+------------------------------------------------------------------+
+void ResetPatternCounters() {
+   consecutiveUpTicks = 0;
+   consecutiveDownTicks = 0;
+   waitingForReversal = false;
+   reversalCounter = 0;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate lot size based on risk percentage                     |
 //+------------------------------------------------------------------+
 double CalculateLotSize() {
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
@@ -315,19 +265,45 @@ double CalculateLotSize() {
    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-   
-   if(LotMode == LOT_CENTS) {
-      // For cent accounts, 0.01 is the standard minimum
-      minLot = 0.01;
-      lot = MathMax(minLot, MathMin(maxLot, lot));
-      lot = MathRound(lot / stepLot) * stepLot;
-      lot = MathMax(0.01, lot);
-   } else {
-      lot = MathMax(minLot, MathMin(maxLot, lot));
-      lot = MathRound(lot / stepLot) * stepLot;
-   }
+   lot = MathMax(minLot, MathMin(maxLot, lot));
+   lot = MathRound(lot / stepLot) * stepLot;
+   lot = MathMax(0.01, lot);
    return lot;
 }
+
+//+------------------------------------------------------------------+
+//| Apply trailing stop                                             |
+//+------------------------------------------------------------------+
+void ApplyTrailingStop() {
+   for(int i = PositionsTotal()-1; i >= 0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentPrice = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ?
+                            SymbolInfoDouble(_Symbol, SYMBOL_BID) :
+                            SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double profitPoints = (currentPrice - openPrice) / _Point;
+      if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+         profitPoints = -profitPoints;
+      
+      if(profitPoints >= TrailingStartPts) {
+         double newSL = 0;
+         if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) {
+            newSL = currentPrice - TrailingStepPts * _Point;
+            if(newSL > currentSL)
+               trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
+         } else {
+            newSL = currentPrice + TrailingStepPts * _Point;
+            if(newSL < currentSL || currentSL == 0)
+               trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
+         }
+      }
+   }
+}
+//+------------------------------------------------------------------+
 EOF
 
 # ============================================
