@@ -19,18 +19,23 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # V16.3 - PROFIT-MAX VELOCITY BOT (ULTRA PROFITABILITY)
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
+//+------------------------------------------------------------------+
+//|                                          ArbitrageProfitBuffer.mq5|
+//|                     Tiny entry gap, close only at target profit |
+//+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
-#property copyright "Omni-Apex V22.0"
-#property version   "22.00"
+#property copyright "Omni-Apex V23.0"
+#property version   "23.00"
 #property strict
 
-// --- INPUTS (ultra loose)
+// --- INPUTS (adjusted for easy entry + profit buffer) -------------+
 input string BinanceSymbol     = "BTCUSDT";
-input double RiskPercent       = 5.0;       // % of equity per trade
-input int    MinDiff_Points    = 0;         // Any price difference triggers trade
-input int    MaxOpenPositions  = 30;
-input int    MagicNumber       = 999022;
+input double RiskPercent       = 5.0;          // % of equity per trade
+input int    MinDiff_Points    = 10;           // TINY threshold (10 points ≈ $1 for BTC)
+input int    MaxOpenPositions  = 5;
+input int    MagicNumber       = 999023;
+input double MinProfitUSD      = 0.50;         // Minimum profit in USD to close (profit buffer)
 
 // --- GLOBALS
 CTrade trade;
@@ -47,10 +52,10 @@ int OnInit() {
    SymbolSelect(_Symbol, true);
    
    Print("==============================================");
-   Print("🟢 EA V22.0 - FORCE TRADE ON ANY PRICE DIFFERENCE");
-   Print("   Binance Symbol: ", BinanceSymbol);
-   Print("   MT5 Symbol: ", _Symbol);
-   Print("   MinDiff_Points: ", MinDiff_Points, " (any difference > 0 opens trade)");
+   Print("🟢 EA V23.0 - TINY GAP + PROFIT BUFFER");
+   Print("   Binance: ", BinanceSymbol, " | MT5: ", _Symbol);
+   Print("   MinDiff_Points: ", MinDiff_Points);
+   Print("   MinProfitUSD: ", MinProfitUSD);
    Print("==============================================");
    return(INIT_SUCCEEDED);
 }
@@ -73,14 +78,14 @@ double GetJsonDouble(string text, string key) {
 //| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick() {
-   // --- 1. CLOSE ANY POSITION WITH POSITIVE PROFIT (FAST OUT) ---
+   // --- 1. CLOSE POSITIONS ONLY WHEN PROFIT >= MinProfitUSD ---
    for(int i = PositionsTotal()-1; i >= 0; i--) {
       ulong ticket = PositionGetTicket(i);
       if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
          double profit = PositionGetDouble(POSITION_PROFIT);
-         if(profit > 0.0) {
+         if(profit >= MinProfitUSD) {   // only close when profit reaches the buffer
             if(trade.PositionClose(ticket)) {
-               Print("✅ [CLOSE] Ticket ", ticket, " closed with profit: ", profit);
+               Print("✅ [CLOSE] Ticket ", ticket, " profit: ", profit, " USD");
             } else {
                Print("❌ [CLOSE] Failed, error: ", GetLastError());
             }
@@ -141,26 +146,25 @@ void OnTick() {
       Print("========================================");
    }
    
-   // --- 7. OPEN TRADE ON ANY DIFFERENCE ---
+   // --- 7. OPEN TRADE (tiny gap) ---
    double lot = NormalizeDouble(AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPercent / 100.0), 2);
    lot = MathMax(0.01, lot);
    
    if(buy_signal) {
-      if(trade.Buy(lot, _Symbol, mt5_ask, 0, 0, "Force Buy")) {
+      if(trade.Buy(lot, _Symbol, mt5_ask, 0, 0, "TinyGap Buy")) {
          Print("🔥 [BUY OPEN] Diff: ", diff_points, " points | Lot: ", lot, " @ ", mt5_ask);
       } else {
          Print("❌ [BUY FAIL] Error: ", GetLastError());
       }
    }
    else if(sell_signal) {
-      if(trade.Sell(lot, _Symbol, mt5_bid, 0, 0, "Force Sell")) {
+      if(trade.Sell(lot, _Symbol, mt5_bid, 0, 0, "TinyGap Sell")) {
          Print("🔥 [SELL OPEN] Diff: ", diff_points, " points | Lot: ", lot, " @ ", mt5_bid);
       } else {
          Print("❌ [SELL FAIL] Error: ", GetLastError());
       }
    }
 }
-
 EOF
 
 # ============================================
