@@ -20,55 +20,120 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                     Ultra_Aggressive_Tick_Scalper|
-//|                     Trades on every tick, high win rate pattern  |
-//|                              Target: $5/day on $10 cent account  |
+//|                                        Aggressive_Cent_Scalper  |
+//|                         Fixed lot option + News filter added    |
+//|                              Opens trades frequently on M1      |
+//|                                      Target $2/day on $10 cent  |
 //+------------------------------------------------------------------+
 #property copyright "Aggressive Scalper"
-#property version   "5.00"
+#property version   "3.10"
 #property strict
 
 #include <Trade\Trade.mqh>
 
-// === Inputs (Extremely Aggressive for $10 Cent) ===
+// --- Inputs (Aggressive Settings) ---
 input string   t1 = "==== Money Management ====";
-input double   RiskPercent       = 15.0;       // 15% risk per trade (very aggressive)
-input int      StopLossPoints    = 60;         // 6 pips SL
-input int      TakeProfitPoints  = 30;         // 3 pips TP (tiny, for high win rate)
-input int      MaxConcurrentTrades = 2;        // Max positions at once
-input int      MagicNumber       = 777123;
+input bool     UseFixedLot       = false;      // true = use fixed lot, false = use RiskPercent
+input double   FixedLotSize      = 0.01;       // Fixed lot when UseFixedLot = true
+input double   RiskPercent       = 10.0;       // 10% risk per trade (only if UseFixedLot = false)
+input int      StopLossPoints    = 100;        // 10 pips SL
+input int      TakeProfitPoints  = 50;         // 5 pips TP (faster wins)
+input int      MaxConcurrentTrades = 3;        // Up to 3 positions at once
+input int      MagicNumber       = 999888;
 
-input string   t2 = "==== Tick Pattern ====";
-input int      ConsecutiveTicksNeeded = 3;     // Number of same-direction ticks to start
-input int      ReversalTicksRequired = 2;      // Opposite ticks to confirm reversal
-input int      MinTickMovementPoints = 2;      // Minimum price change per tick (filter noise)
+input string   t2 = "==== Entry Triggers (Aggressive) ====";
+input bool     UseMomentum       = true;       // Trade on price momentum (recommended)
+input int      MomentumPoints    = 15;         // If price moves 1.5 pips in last 5 seconds, trade
+input bool     UseRSI            = true;       // Use RSI as secondary confirmation
+input int      RsiPeriod         = 7;          // Fast RSI
+input int      RsiBuyLevel       = 40;         // Buy when RSI < 40
+input int      RsiSellLevel      = 60;         // Sell when RSI > 60
+input bool     UseMA             = false;      // Optional moving average filter
+input int      MAPeriod          = 20;         // For trend filter
 
-input string   t3 = "==== Aggressive Filters ====";
-input int      MaxSpreadPoints   = 30;         // Max 3 pips spread (lenient)
-input bool     UseTimeFilter     = true;       // Only trade during active sessions
-input int      StartHour         = 8;          // GMT (London open)
-input int      EndHour           = 20;         // GMT (NY close)
-input bool     UseTrailingStop   = true;
-input int      TrailingStartPts  = 15;         // Start trailing at 1.5 pips profit
-input int      TrailingStepPts   = 8;          // Trail by 0.8 pips
+input string   t3 = "==== Filters ====";
+input int      MaxSpreadPoints   = 30;         // Max 3 pips spread
+input bool     UseATRFilter      = false;      // Disable ATR filter for more trades
+input double   MinATRMultiplier  = 0.1;        // Very low if enabled
+input int      ATRPeriod         = 14;
 
 input string   t4 = "==== Daily Limits ====";
-input double   DailyTargetUSD    = 5.0;        // Stop after $5 profit (500 cents)
-input double   MaxDailyLossUSD   = 2.0;        // Stop after $2 loss (200 cents)
+input double   DailyTargetUSD    = 2.0;        // Stop after $2 profit
+input double   MaxDailyLossUSD   = 1.0;        // Stop after $1 loss
+input bool     UseTrailingStop   = true;
+input int      TrailingStartPts  = 30;         // Start trailing at 3 pips profit
+input int      TrailingStepPts   = 15;         // Trail by 1.5 pips
 
-// === Globals ===
+input string   t5 = "==== News Filter ====";
+input bool     UseNewsFilter     = true;       // Enable news filter
+input string   NewsTimes         = "08:30,10:00,14:30"; // Comma-separated news times (broker time, HH:MM)
+input int      NewsBufferMinutes = 15;         // Stop trading X min before and after each news event
+
+// --- Globals ---
 CTrade trade;
-datetime lastTradeTime = 0;
-double lastPrice = 0;
-int consecutiveUpTicks = 0;
-int consecutiveDownTicks = 0;
-int reversalCounter = 0;   // number of opposite ticks after a run
-bool waitingForReversal = false;
-bool lastDirectionUp = false;
+int rsi_handle, atr_handle, ma_handle;
+double rsi_buf[], atr_buf[], ma_buf[];
+datetime lastBarTime = 0;
 double dailyProfit = 0.0;
 double startBalance = 0.0;
 bool tradingHalted = false;
+datetime lastTradeTime = 0;
 int tradeCountToday = 0;
+
+// --- Helper for news filter ---
+string newsTimesArr[];   // Stores parsed times as minutes since midnight
+int newsTimesCount = 0;
+
+//+------------------------------------------------------------------+
+//| Parse comma-separated news times into minutes since midnight    |
+//+------------------------------------------------------------------+
+void ParseNewsTimes() {
+   newsTimesCount = 0;
+   string temp = NewsTimes;
+   StringReplace(temp, " ", ""); // Remove spaces
+   int pos = 0;
+   for(int i = 0; i < 50; i++) {  // Max 50 entries
+      int comma = StringFind(temp, ",", pos);
+      string token;
+      if(comma == -1) {
+         token = StringSubstr(temp, pos);
+         if(StringLen(token) > 0) {
+            int hour = (int)StringToInteger(StringSubstr(token, 0, 2));
+            int minute = (int)StringToInteger(StringSubstr(token, 3, 2));
+            newsTimesArr[newsTimesCount] = hour * 60 + minute;
+            newsTimesCount++;
+         }
+         break;
+      } else {
+         token = StringSubstr(temp, pos, comma - pos);
+         if(StringLen(token) > 0) {
+            int hour = (int)StringToInteger(StringSubstr(token, 0, 2));
+            int minute = (int)StringToInteger(StringSubstr(token, 3, 2));
+            newsTimesArr[newsTimesCount] = hour * 60 + minute;
+            newsTimesCount++;
+         }
+         pos = comma + 1;
+      }
+   }
+   ArrayResize(newsTimesArr, newsTimesCount);
+}
+
+//+------------------------------------------------------------------+
+//| Check if current time is inside news buffer window              |
+//+------------------------------------------------------------------+
+bool IsNewsTime() {
+   if(!UseNewsFilter) return false;
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   int currentMinutes = dt.hour * 60 + dt.min;
+   for(int i = 0; i < newsTimesCount; i++) {
+      int newsStart = newsTimesArr[i] - NewsBufferMinutes;
+      int newsEnd = newsTimesArr[i] + NewsBufferMinutes;
+      if(currentMinutes >= newsStart && currentMinutes <= newsEnd)
+         return true;
+   }
+   return false;
+}
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                           |
@@ -76,41 +141,71 @@ int tradeCountToday = 0;
 int OnInit() {
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetTypeFilling(ORDER_FILLING_FOK);
+   
+   // Create indicators
+   if(UseRSI) rsi_handle = iRSI(_Symbol, PERIOD_M1, RsiPeriod, PRICE_CLOSE);
+   if(UseATRFilter) atr_handle = iATR(_Symbol, PERIOD_M1, ATRPeriod);
+   if(UseMA) ma_handle = iMA(_Symbol, PERIOD_M1, MAPeriod, 0, MODE_SMA, PRICE_CLOSE);
+   
+   ArraySetAsSeries(rsi_buf, true);
+   ArraySetAsSeries(atr_buf, true);
+   ArraySetAsSeries(ma_buf, true);
+   
+   // Initialize news filter
+   ArrayResize(newsTimesArr, 20);
+   ParseNewsTimes();
+   
    startBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    
    Print("==========================================");
-   Print("⚡ ULTRA AGGRESSIVE TICK SCALPER");
+   Print("⚡ AGGRESSIVE CENT SCALPER ACTIVE");
    Print("   Balance: $", startBalance);
-   Print("   Risk per trade: ", RiskPercent, "%");
-   Print("   TP: 3 pips | SL: 6 pips");
-   Print("   Pattern: ", ConsecutiveTicksNeeded, " ticks one way + ", ReversalTicksRequired, " opposite = trade");
-   Print("   Daily target: $", DailyTargetUSD, " | Max loss: $", MaxDailyLossUSD);
+   if(UseFixedLot)
+      Print("   Lot mode: FIXED | Lot = ", FixedLotSize);
+   else
+      Print("   Lot mode: RISK% | Risk = ", RiskPercent, "%");
+   Print("   TP: ", TakeProfitPoints/10.0, " pips | SL: ", StopLossPoints/10.0, " pips");
+   Print("   Momentum trigger: ", MomentumPoints, " points");
+   Print("   Daily target: $", DailyTargetUSD);
+   if(UseNewsFilter) {
+      Print("   News filter: ON | Buffer = ", NewsBufferMinutes, " min");
+      Print("   Times: ", NewsTimes);
+   }
    Print("==========================================");
    
    return INIT_SUCCEEDED;
 }
 
 //+------------------------------------------------------------------+
-//| Deinitialization                                                |
+//| Deinitialization                                               |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason) {
-   Print("EA stopped. Trades today: ", tradeCountToday);
+   if(UseRSI) IndicatorRelease(rsi_handle);
+   if(UseATRFilter) IndicatorRelease(atr_handle);
+   if(UseMA) IndicatorRelease(ma_handle);
 }
 
 //+------------------------------------------------------------------+
-//| Tick function – runs on every price change                      |
+//| Main tick function (very frequent trades)                       |
 //+------------------------------------------------------------------+
 void OnTick() {
-   // --- Daily limits ---
+   // --- NEWS FILTER: Pause during high-impact news ---
+   if(IsNewsTime()) {
+      Comment("News Filter ACTIVE: Trading paused."); // optional visual
+      return;
+   }
+   
+   // --- Daily profit limits ---
    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    dailyProfit = currentBalance - startBalance;
+   
    if(dailyProfit >= DailyTargetUSD) {
-      if(!tradingHalted) Print("🎯 Daily target reached: $", dailyProfit);
+      if(!tradingHalted) Print("🎯 Daily target $", DailyTargetUSD, " reached. Halted.");
       tradingHalted = true;
       return;
    }
    if(dailyProfit <= -MaxDailyLossUSD) {
-      if(!tradingHalted) Print("💀 Daily loss limit hit: $", dailyProfit);
+      if(!tradingHalted) Print("💀 Max daily loss $", MaxDailyLossUSD, " hit. Halted.");
       tradingHalted = true;
       return;
    }
@@ -126,153 +221,150 @@ void OnTick() {
          tradingHalted = false;
          startBalance = currentBalance;
          tradeCountToday = 0;
-         Print("🔄 New day - Resuming");
+         Print("🔄 New trading day - Resuming");
       }
       return;
-   }
-   
-   // --- Time filter ---
-   if(UseTimeFilter) {
-      MqlDateTime dt;
-      TimeToStruct(TimeCurrent(), dt);
-      int hour = dt.hour;
-      if(hour < StartHour || hour > EndHour) return;
    }
    
    // --- Spread filter ---
    int spread = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
    if(spread > MaxSpreadPoints) return;
    
-   // --- Position limit ---
+   // --- Optional ATR filter (disabled by default for more trades)---
+   if(UseATRFilter) {
+      CopyBuffer(atr_handle, 0, 0, 2, atr_buf);
+      double atrPips = atr_buf[0] / SymbolInfoDouble(_Symbol, SYMBOL_POINT) / 10.0;
+      if(atrPips < MinATRMultiplier) return;
+   }
+   
+   // --- Count open positions ---
    int posCount = 0;
    for(int i = PositionsTotal()-1; i >= 0; i--) {
       ulong ticket = PositionGetTicket(i);
-      if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
-         posCount++;
+      if(PositionSelectByTicket(ticket)) {
+         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber) posCount++;
+      }
    }
    if(posCount >= MaxConcurrentTrades) return;
    
-   // --- Cooldown: avoid multiple trades in same second ---
-   if(TimeCurrent() - lastTradeTime < 1) return;
+   // --- COOLDOWN: avoid too many trades per second (0.5 sec) ---
+   if(TimeCurrent() - lastTradeTime < 0.5) return;
    
-   // --- Get current bid price (for sells) and ask (for buys) ---
-   double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   // --- Calculate signals ---
+   bool buySignal = false;
+   bool sellSignal = false;
    
-   // --- Track tick direction and magnitude ---
-   if(lastPrice != 0) {
-      double movePoints = (currentBid - lastPrice) / point;
+   // 1. Momentum trigger (price movement in last few ticks)
+   if(UseMomentum) {
+      double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      static double previousPrice = 0;
+      static datetime lastCheck = 0;
       
-      // Only count ticks with minimum movement (filter noise)
-      if(MathAbs(movePoints) >= MinTickMovementPoints) {
-         if(movePoints > 0) {
-            // Up tick
-            if(waitingForReversal && !lastDirectionUp) {
-               // We were in a down run, now an up tick → reversal count
-               reversalCounter++;
-            } else if(!waitingForReversal) {
-               // Start a new run
-               consecutiveDownTicks = 0;
-               consecutiveUpTicks++;
-               lastDirectionUp = true;
-            }
-         } else if(movePoints < 0) {
-            // Down tick
-            if(waitingForReversal && lastDirectionUp) {
-               reversalCounter++;
-            } else if(!waitingForReversal) {
-               consecutiveUpTicks = 0;
-               consecutiveDownTicks++;
-               lastDirectionUp = false;
-            }
+      if(TimeCurrent() - lastCheck >= 2) {  // Check every 2 seconds
+         double move = MathAbs(currentPrice - previousPrice) / _Point;
+         if(previousPrice != 0 && move >= MomentumPoints) {
+            if(currentPrice > previousPrice) buySignal = true;
+            else sellSignal = true;
          }
-      }
-      
-      // Check if we have enough consecutive ticks to start waiting for reversal
-      if(!waitingForReversal && (consecutiveUpTicks >= ConsecutiveTicksNeeded || consecutiveDownTicks >= ConsecutiveTicksNeeded)) {
-         waitingForReversal = true;
-         reversalCounter = 0;
-      }
-      
-      // If waiting for reversal and we got enough opposite ticks → trade signal
-      if(waitingForReversal && reversalCounter >= ReversalTicksRequired) {
-         // Determine direction
-         bool buySignal = (consecutiveDownTicks >= ConsecutiveTicksNeeded);  // down run then up reversal = buy
-         bool sellSignal = (consecutiveUpTicks >= ConsecutiveTicksNeeded);   // up run then down reversal = sell
-         
-         if(buySignal || sellSignal) {
-            double lot = CalculateLotSize();
-            lot = MathMax(0.01, lot);
-            
-            if(buySignal) {
-               double entry = currentAsk;
-               double sl = entry - StopLossPoints * point;
-               double tp = entry + TakeProfitPoints * point;
-               sl = NormalizeDouble(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-               tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-               if(trade.Buy(lot, _Symbol, entry, sl, tp, "TickRevBuy")) {
-                  Print("🔥 BUY | Run: ", consecutiveDownTicks, " down ticks → ", reversalCounter, " up ticks | Lot=", lot);
-                  lastTradeTime = TimeCurrent();
-                  tradeCountToday++;
-                  ResetPatternCounters();
-               }
-            } else if(sellSignal) {
-               double entry = currentBid;
-               double sl = entry + StopLossPoints * point;
-               double tp = entry - TakeProfitPoints * point;
-               sl = NormalizeDouble(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-               tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-               if(trade.Sell(lot, _Symbol, entry, sl, tp, "TickRevSell")) {
-                  Print("🔥 SELL | Run: ", consecutiveUpTicks, " up ticks → ", reversalCounter, " down ticks | Lot=", lot);
-                  lastTradeTime = TimeCurrent();
-                  tradeCountToday++;
-                  ResetPatternCounters();
-               }
-            }
-         }
+         previousPrice = currentPrice;
+         lastCheck = TimeCurrent();
       }
    }
    
-   lastPrice = currentBid;
+   // 2. RSI confirmation (if enabled and no momentum signal yet)
+   if(UseRSI && !buySignal && !sellSignal) {
+      if(CopyBuffer(rsi_handle, 0, 0, 2, rsi_buf) < 2) return;
+      double rsi = rsi_buf[0];
+      if(rsi < RsiBuyLevel) buySignal = true;
+      if(rsi > RsiSellLevel) sellSignal = true;
+   }
    
-   // --- Apply trailing stop to existing positions ---
+   // 3. Moving average trend filter (optional, can be disabled)
+   if(UseMA && (buySignal || sellSignal)) {
+      if(CopyBuffer(ma_handle, 0, 0, 2, ma_buf) < 2) return;
+      double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(buySignal && price < ma_buf[0]) buySignal = false;  // Don't buy below MA
+      if(sellSignal && price > ma_buf[0]) sellSignal = false;
+   }
+   
+   // --- If no signal, do nothing ---
+   if(!buySignal && !sellSignal) return;
+   
+   // --- Execute trade ---
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double lot = CalculateLotSize();
+   lot = MathMax(0.01, lot);
+   
+   if(buySignal) {
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double sl = ask - StopLossPoints * point;
+      double tp = ask + TakeProfitPoints * point;
+      sl = NormalizeDouble(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+      tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+      
+      if(trade.Buy(lot, _Symbol, ask, sl, tp, "AggBuy")) {
+         Print("🔥 BUY | Lot=", lot, " | TP=", tp, " | SL=", sl);
+         lastTradeTime = TimeCurrent();
+         tradeCountToday++;
+      } else {
+         Print("❌ Buy failed. Error: ", GetLastError());
+      }
+   }
+   else if(sellSignal) {
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double sl = bid + StopLossPoints * point;
+      double tp = bid - TakeProfitPoints * point;
+      sl = NormalizeDouble(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+      tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+      
+      if(trade.Sell(lot, _Symbol, bid, sl, tp, "AggSell")) {
+         Print("🔥 SELL | Lot=", lot, " | TP=", tp, " | SL=", sl);
+         lastTradeTime = TimeCurrent();
+         tradeCountToday++;
+      } else {
+         Print("❌ Sell failed. Error: ", GetLastError());
+      }
+   }
+   
+   // --- Apply trailing stop to open positions ---
    if(UseTrailingStop) ApplyTrailingStop();
 }
 
 //+------------------------------------------------------------------+
-//| Reset pattern counters after trade                              |
-//+------------------------------------------------------------------+
-void ResetPatternCounters() {
-   consecutiveUpTicks = 0;
-   consecutiveDownTicks = 0;
-   waitingForReversal = false;
-   reversalCounter = 0;
-}
-
-//+------------------------------------------------------------------+
-//| Calculate lot size based on risk percentage                     |
+//| Calculate lot size based on fixed lot or risk %                 |
 //+------------------------------------------------------------------+
 double CalculateLotSize() {
-   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   double riskAmount = balance * RiskPercent / 100.0;
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   double slPoints = StopLossPoints;
-   double riskPerLot = slPoints * tickValue;
-   double lot = riskAmount / riskPerLot;
-   
-   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-   double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-   lot = MathMax(minLot, MathMin(maxLot, lot));
-   lot = MathRound(lot / stepLot) * stepLot;
-   lot = MathMax(0.01, lot);
-   return lot;
+   if(UseFixedLot) {
+      // Use the fixed lot size directly
+      double lot = FixedLotSize;
+      double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+      double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+      double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+      lot = MathMax(minLot, MathMin(maxLot, lot));
+      lot = MathRound(lot / stepLot) * stepLot;
+      return MathMax(minLot, lot);
+   } else {
+      // Original risk-based calculation
+      double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+      double riskAmount = balance * RiskPercent / 100.0;
+      double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+      double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+      double slPoints = StopLossPoints;
+      double riskPerLot = slPoints * tickValue;
+      double lot = riskAmount / riskPerLot;
+      
+      double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+      double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+      double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+      lot = MathMax(minLot, MathMin(maxLot, lot));
+      lot = MathRound(lot / stepLot) * stepLot;
+      lot = MathMax(0.01, lot);
+      return lot;
+   }
 }
 
 //+------------------------------------------------------------------+
-//| Apply trailing stop                                             |
+//| Trailing stop                                                   |
 //+------------------------------------------------------------------+
 void ApplyTrailingStop() {
    for(int i = PositionsTotal()-1; i >= 0; i--) {
