@@ -80,61 +80,44 @@ bool tradingHalted = false;
 datetime lastTradeTime = 0;
 int tradeCountToday = 0;
 
-// --- Helper for news filter ---
-string newsTimesArr[];   // Stores parsed times as minutes since midnight
-int newsTimesCount = 0;
+// --- News Filter Variables ---
+int newsMinutesArray[50];
+int newsMinutesCount = 0;
 
 //+------------------------------------------------------------------+
-//| Parse comma-separated news times into minutes since midnight    |
+//| Parse comma-separated news times                                 |
 //+------------------------------------------------------------------+
 void ParseNewsTimes() {
-   newsTimesCount = 0;
+   newsMinutesCount = 0;
    string temp = NewsTimes;
-   StringReplace(temp, " ", ""); // Remove spaces
-   int pos = 0;
-   for(int i = 0; i < 50; i++) {  // Max 50 entries
-      int comma = StringFind(temp, ",", pos);
-      string token;
-      if(comma == -1) {
-         token = StringSubstr(temp, pos);
-         if(StringLen(token) > 0) {
-            int hour = (int)StringToInteger(StringSubstr(token, 0, 2));
-            int minute = (int)StringToInteger(StringSubstr(token, 3, 2));
-            newsTimesArr[newsTimesCount] = hour * 60 + minute;
-            newsTimesCount++;
-         }
-         break;
-      } else {
-         token = StringSubstr(temp, pos, comma - pos);
-         if(StringLen(token) > 0) {
-            int hour = (int)StringToInteger(StringSubstr(token, 0, 2));
-            int minute = (int)StringToInteger(StringSubstr(token, 3, 2));
-            newsTimesArr[newsTimesCount] = hour * 60 + minute;
-            newsTimesCount++;
-         }
-         pos = comma + 1;
-      }
+   StringReplace(temp, " ", "");
+   string parts[50];
+   int partCount = StringSplit(temp, ',', parts);
+   for(int i = 0; i < partCount && i < 50; i++) {
+      int hour = (int)StringToInteger(StringSubstr(parts[i], 0, 2));
+      int minute = (int)StringToInteger(StringSubstr(parts[i], 3, 2));
+      newsMinutesArray[newsMinutesCount] = hour * 60 + minute;
+      newsMinutesCount++;
    }
-   ArrayResize(newsTimesArr, newsTimesCount);
 }
 
 //+------------------------------------------------------------------+
-//| Check if current time is inside news buffer window              |
+//| Check if current time is inside news buffer                      |
 //+------------------------------------------------------------------+
 bool IsNewsTime() {
    if(!UseNewsFilter) return false;
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
    int currentMinutes = dt.hour * 60 + dt.min;
-   for(int i = 0; i < newsTimesCount; i++) {
-      int newsStart = newsTimesArr[i] - NewsBufferMinutes;
-      int newsEnd = newsTimesArr[i] + NewsBufferMinutes;
-      if(currentMinutes >= newsStart && currentMinutes <= newsEnd)
+   for(int i = 0; i < newsMinutesCount; i++) {
+      int startMinutes = newsMinutesArray[i] - NewsBufferMinutes;
+      int endMinutes   = newsMinutesArray[i] + NewsBufferMinutes;
+      if(currentMinutes >= startMinutes && currentMinutes <= endMinutes) {
          return true;
+      }
    }
    return false;
 }
-
 //+------------------------------------------------------------------+
 //| Expert initialization                                           |
 //+------------------------------------------------------------------+
