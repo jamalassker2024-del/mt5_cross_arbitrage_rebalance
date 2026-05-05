@@ -19,9 +19,6 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # V16.3 - PROFIT-MAX VELOCITY BOT (ULTRA PROFITABILITY)
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
-
-
-
 //+------------------------------------------------------------------+
 //|                                           Tick_Pattern_Scalper   |
 //|                     Tick-based high-probability pattern scalper  |
@@ -342,7 +339,6 @@ void ApplyTrailingStop() {
    }
 }
 //+------------------------------------------------------------------+
-
 EOF
 
 # ============================================
