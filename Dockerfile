@@ -19,19 +19,21 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # V16.3 - PROFIT-MAX VELOCITY BOT (ULTRA PROFITABILITY)
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
-الروبوت الرابح
-
-
+//+------------------------------------------------------------------+
+//|                                      الروبوت الرابح - Exact 3pt |
+//|                     Only trades when difference ≈ 3 points      |
+//+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
-#property copyright "Omni-Apex V22.0"
-#property version   "22.00"
+#property copyright "Omni-Apex V22.0 - Modified"
+#property version   "22.01"
 #property strict
 
-// --- INPUTS (ultra loose)
+// --- INPUTS
 input string BinanceSymbol     = "BTCUSDT";
-input double RiskPercent       = 1.0;       // % of equity per trade
-input int    MinDiff_Points    = 0;         // Any price difference triggers trade
+input double RiskPercent       = 20.0;          // % of equity per trade
+input int    MinDiff_Points    = 5;            // Desired difference (absolute value)
+input double DiffExactTolerance = 0.5;         // Acceptable deviation (± points) – trade only when diff ≈ MinDiff_Points
 input int    MaxOpenPositions  = 5;
 input int    MagicNumber       = 999022;
 
@@ -50,10 +52,10 @@ int OnInit() {
    SymbolSelect(_Symbol, true);
    
    Print("==============================================");
-   Print("🟢 EA V22.0 - FORCE TRADE ON ANY PRICE DIFFERENCE");
+   Print("🟢 EA - EXACT 3 POINT DIFFERENCE TRADER");
    Print("   Binance Symbol: ", BinanceSymbol);
    Print("   MT5 Symbol: ", _Symbol);
-   Print("   MinDiff_Points: ", MinDiff_Points, " (any difference > 0 opens trade)");
+   Print("   Target difference: ", MinDiff_Points, " ± ", DiffExactTolerance, " points");
    Print("==============================================");
    return(INIT_SUCCEEDED);
 }
@@ -128,10 +130,16 @@ void OnTick() {
    // --- 5. CALCULATE DIFFERENCE (in points) ---
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    double diff_points = (binance_mid - mt5_mid) / point;
-   bool buy_signal = (diff_points > MinDiff_Points);
-   bool sell_signal = (diff_points < -MinDiff_Points);
    
-   // --- 6. DEBUG OUTPUT (every 5 seconds) ---
+   // --- 6. NEW LOGIC: trade only when diff is approximately MinDiff_Points (± tolerance) ---
+   double absDiff = MathAbs(diff_points);
+   bool exactDiff = (absDiff >= MinDiff_Points - DiffExactTolerance && 
+                     absDiff <= MinDiff_Points + DiffExactTolerance);
+   
+   bool buy_signal = (diff_points > 0 && exactDiff);
+   bool sell_signal = (diff_points < 0 && exactDiff);
+   
+   // --- 7. DEBUG OUTPUT (every 5 seconds) ---
    if(TimeCurrent() - last_debug_time >= 5) {
       last_debug_time = TimeCurrent();
       Print("========================================");
@@ -140,30 +148,31 @@ void OnTick() {
       Print("📊 MT5 Mid: ", DoubleToString(mt5_mid, _Digits));
       Print("📊 Binance Mid: ", DoubleToString(binance_mid, _Digits));
       Print("📊 Difference: ", DoubleToString(diff_points, 2), " points");
+      Print("📊 Exact 3pt match: ", exactDiff ? "YES" : "NO");
       Print("📊 Buy signal: ", buy_signal ? "YES" : "NO", " | Sell signal: ", sell_signal ? "YES" : "NO");
       Print("========================================");
    }
    
-   // --- 7. OPEN TRADE ON ANY DIFFERENCE ---
+   // --- 8. OPEN TRADE ONLY WHEN EXACT DIFFERENCE IS NEAR 3 POINTS ---
    double lot = NormalizeDouble(AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPercent / 100.0), 2);
    lot = MathMax(0.01, lot);
    
    if(buy_signal) {
-      if(trade.Buy(lot, _Symbol, mt5_ask, 0, 0, "Force Buy")) {
+      if(trade.Buy(lot, _Symbol, mt5_ask, 0, 0, "Exact3pt Buy")) {
          Print("🔥 [BUY OPEN] Diff: ", diff_points, " points | Lot: ", lot, " @ ", mt5_ask);
       } else {
          Print("❌ [BUY FAIL] Error: ", GetLastError());
       }
    }
    else if(sell_signal) {
-      if(trade.Sell(lot, _Symbol, mt5_bid, 0, 0, "Force Sell")) {
+      if(trade.Sell(lot, _Symbol, mt5_bid, 0, 0, "Exact3pt Sell")) {
          Print("🔥 [SELL OPEN] Diff: ", diff_points, " points | Lot: ", lot, " @ ", mt5_bid);
       } else {
          Print("❌ [SELL FAIL] Error: ", GetLastError());
       }
    }
 }
-
+//+------------------------------------------------------------------+
 EOF
 
 # ============================================
