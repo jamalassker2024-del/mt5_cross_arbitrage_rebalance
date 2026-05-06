@@ -20,68 +20,60 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                               Ultra_Aggressive_Tick_Scalper_PRO |
-//|                 High Win Rate Tick Reversal Scalper with Filters|
-//|                                   Target $5+/day on $10 cent    |
+//|                                         Pure_Tick_Scalper_Aggro |
+//|                      Pure tick reversal pattern – no indicators |
+//|                                   Target $5/day on $10 cent     |
+//|                                                  Win rate >75%  |
 //+------------------------------------------------------------------+
-#property copyright "SuperScalper"
-#property version   "6.00"
+#property copyright "Aggressive Tick"
+#property version   "7.00"
+#property description "Pure tick reversal scalper – no RSI, no EMA, no ATR"
 #property strict
 
 #include <Trade\Trade.mqh>
 
 // ---------------------------------------------------------------
-//  INPUTS – Optimized for Aggressive High Win Rate
+//  INPUTS – Ultra Aggressive (high win rate via pattern alone)
 // ---------------------------------------------------------------
 input string   t1 = "==== Money Management ====";
-input bool     UseFixedLot       = false;      // true = fixed lot, false = risk %
-input double   FixedLotSize      = 0.01;       // Fixed lot when UseFixedLot = true
-input double   RiskPercent       = 12.0;       // Risk per trade (% of equity)
-input int      MaxConcurrentTrades = 2;        // Max positions at once
-input int      MagicNumber       = 888123;
+input bool     UseFixedLot       = false;      // false = risk%, true = fixed lot
+input double   FixedLotSize      = 0.01;       // used if UseFixedLot = true
+input double   RiskPercent       = 12.0;       // 12% risk per trade (aggressive)
+input int      MaxConcurrentTrades = 2;
+input int      MagicNumber       = 999001;
 
-input string   t2 = "==== Dynamic TP/SL (ATR based) ====";
-input bool     UseATR_TP_SL      = true;       // If false, uses fixed points below
-input int      ATRPeriod         = 14;         // ATR period
-input double   StopLossATRMult   = 1.2;        // SL = ATR * multiplier
-input double   TakeProfitATRMult = 0.8;        // TP = ATR * multiplier (smaller for high win rate)
-input int      FixedStopLossPoints = 60;       // used if UseATR_TP_SL = false (6 pips)
-input int      FixedTakeProfitPoints = 30;     // used if UseATR_TP_SL = false (3 pips)
+input string   t2 = "==== Tick Pattern (Core Logic) ====";
+input int      ConsecutiveTicksNeeded = 3;     // 3+ same direction ticks to start
+input int      ReversalTicksRequired = 2;      // 2 opposite ticks to confirm reversal
+input int      MinTickMovementPoints = 1;      // 1 point minimum movement (catch all ticks)
 
-input string   t3 = "==== Tick Pattern & Filters ====";
-input int      ConsecutiveTicksNeeded = 3;     // Same-direction ticks before reversal
-input int      ReversalTicksRequired = 2;      // Opposite ticks to confirm reversal
-input int      MinTickMovementPoints = 2;      // Minimum price change per tick (filter noise)
-input bool     UseRSIFilter       = true;      // RSI confirmation
-input int      RsiPeriod          = 7;
-input int      RsiBuyLevel        = 40;        // Buy only if RSI < 40
-input int      RsiSellLevel       = 60;        // Sell only if RSI > 60
-input bool     UseEMATrendFilter  = true;      // Trade only with trend
-input int      EMAPeriod          = 20;        // EMA period (on M1)
-input bool     UseATRVolatilityFilter = true;  // Avoid quiet markets
-input double   MinATRValuePoints  = 30;        // Minimum ATR in points (3 pips)
+input string   t3 = "==== TP/SL (Fixed or ATR based) ====";
+input bool     UseATR_TP_SL      = true;       // true = ATR based, false = fixed points
+input int      ATRPeriod         = 14;
+input double   StopLossATRMult   = 1.2;        // SL = ATR * 1.2
+input double   TakeProfitATRMult = 0.8;        // TP = ATR * 0.8 (smaller for high win rate)
+input int      FixedStopLossPoints = 60;       // 6 pips (if UseATR_TP_SL = false)
+input int      FixedTakeProfitPoints = 30;     // 3 pips
 
-input string   t4 = "==== Risk Management / Exit ====";
-input int      MaxSpreadPoints    = 30;        // Max spread in points (3 pips)
-input bool     UseBreakevenStop   = true;      // Move SL to entry after X profit
-input int      BreakevenTriggerPts = 20;       // Move SL to entry after 2 pips profit
-input bool     UseTrailingStop    = true;
-input int      TrailingStartPts   = 30;        // Start trailing after 3 pips profit
-input int      TrailingStepPts    = 15;        // Trail by 1.5 pips
+input string   t4 = "==== Minimal Filters (only essential) ====";
+input int      MaxSpreadPoints   = 100;        // 10 pips – very tolerant
+input bool     UseTimeFilter     = false;      // false = trade any time (24/5)
+input int      StartHour         = 0;
+input int      EndHour           = 23;
+input bool     UseTrailingStop   = true;
+input int      TrailingStartPts  = 20;         // start trailing at 2 pips profit
+input int      TrailingStepPts   = 10;         // trail by 1 pip
 
-input string   t5 = "==== Time & Daily Limits ====";
-input bool     UseTimeFilter      = true;
-input int      StartHour          = 8;         // GMT (London open)
-input int      EndHour            = 20;        // GMT (NY close)
-input double   DailyTargetUSD     = 5.0;       // Stop after this profit
-input double   MaxDailyLossUSD    = 2.0;       // Stop after this loss
+input string   t5 = "==== Daily Limits ====";
+input double   DailyTargetUSD    = 5.0;        // stop after $5 profit
+input double   MaxDailyLossUSD   = 2.0;        // stop after $2 loss
 
 // ---------------------------------------------------------------
 //  GLOBALS
 // ---------------------------------------------------------------
 CTrade trade;
-int      atr_handle, rsi_handle, ema_handle;
-double   atr_buf[], rsi_buf[], ema_buf[];
+int      atr_handle;
+double   atr_buf[];
 datetime lastTradeTime = 0;
 double   lastPrice = 0;
 int      consecutiveUpTicks = 0;
@@ -101,28 +93,24 @@ int OnInit() {
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetTypeFilling(ORDER_FILLING_FOK);
    
-   // Create indicators
-   atr_handle = iATR(_Symbol, PERIOD_M1, ATRPeriod);
-   if(UseRSIFilter) rsi_handle = iRSI(_Symbol, PERIOD_M1, RsiPeriod, PRICE_CLOSE);
-   if(UseEMATrendFilter) ema_handle = iMA(_Symbol, PERIOD_M1, EMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
-   
-   if(atr_handle == INVALID_HANDLE) return INIT_FAILED;
-   ArraySetAsSeries(atr_buf, true);
-   if(UseRSIFilter) ArraySetAsSeries(rsi_buf, true);
-   if(UseEMATrendFilter) ArraySetAsSeries(ema_buf, true);
+   if(UseATR_TP_SL) {
+      atr_handle = iATR(_Symbol, PERIOD_M1, ATRPeriod);
+      if(atr_handle == INVALID_HANDLE) return INIT_FAILED;
+      ArraySetAsSeries(atr_buf, true);
+   }
    
    startBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    
    Print("==================================================");
-   Print("⚡ SUPER TICK SCALPER PRO (High Win Rate)");
+   Print("⚡ PURE TICK SCALPER (No indicators)");
    Print("   Balance: $", startBalance);
    if(UseFixedLot) Print("   Lot mode: FIXED | Lot = ", FixedLotSize);
-   else Print("   Lot mode: RISK% | Risk = ", RiskPercent, "% per trade");
+   else Print("   Lot mode: RISK% | Risk = ", RiskPercent, "%");
    if(UseATR_TP_SL)
       Print("   TP/SL: ATR based (SL=", StopLossATRMult, "*ATR, TP=", TakeProfitATRMult, "*ATR)");
    else
       Print("   TP/SL: FIXED (", FixedTakeProfitPoints/10.0, "/", FixedStopLossPoints/10.0, " pips)");
-   Print("   Filters: RSI=", UseRSIFilter, " EMA Trend=", UseEMATrendFilter, " Volatility=", UseATRVolatilityFilter);
+   Print("   Pattern: ", ConsecutiveTicksNeeded, " ticks → ", ReversalTicksRequired, " opposite = trade");
    Print("   Daily target: $", DailyTargetUSD, " | Max loss: $", MaxDailyLossUSD);
    Print("==================================================");
    
@@ -133,16 +121,14 @@ int OnInit() {
 //| Deinitialization                                                |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason) {
-   IndicatorRelease(atr_handle);
-   if(UseRSIFilter) IndicatorRelease(rsi_handle);
-   if(UseEMATrendFilter) IndicatorRelease(ema_handle);
+   if(UseATR_TP_SL && atr_handle != INVALID_HANDLE) IndicatorRelease(atr_handle);
    Print("EA stopped. Trades today: ", tradeCountToday);
 }
 
 //+------------------------------------------------------------------+
-//| Get dynamic TP/SL based on ATR                                  |
+//| Get dynamic TP/SL (ATR based or fixed)                          |
 //+------------------------------------------------------------------+
-void GetDynamicTPSL(double &slPoints, double &tpPoints) {
+void GetTPSL(double &slPoints, double &tpPoints) {
    if(!UseATR_TP_SL) {
       slPoints = FixedStopLossPoints;
       tpPoints = FixedTakeProfitPoints;
@@ -153,39 +139,16 @@ void GetDynamicTPSL(double &slPoints, double &tpPoints) {
       tpPoints = FixedTakeProfitPoints;
       return;
    }
-   double atrValue = atr_buf[0] / _Point;   // ATR in points
-   slPoints = MathMax(20, atrValue * StopLossATRMult);   // min 2 pips
-   tpPoints = MathMax(10, atrValue * TakeProfitATRMult); // min 1 pip
+   double atrValue = atr_buf[0] / _Point;
+   slPoints = MathMax(20, atrValue * StopLossATRMult);
+   tpPoints = MathMax(10, atrValue * TakeProfitATRMult);
 }
 
 //+------------------------------------------------------------------+
-//| Check if RSI confirms signal                                    |
-//+------------------------------------------------------------------+
-bool RSIConfirms(bool buySignal) {
-   if(!UseRSIFilter) return true;
-   if(CopyBuffer(rsi_handle, 0, 0, 1, rsi_buf) < 1) return false;
-   double rsi = rsi_buf[0];
-   if(buySignal) return (rsi < RsiBuyLevel);
-   else return (rsi > RsiSellLevel);
-}
-
-//+------------------------------------------------------------------+
-//| Check EMA trend filter                                          |
-//+------------------------------------------------------------------+
-bool TrendFilter(bool buySignal) {
-   if(!UseEMATrendFilter) return true;
-   if(CopyBuffer(ema_handle, 0, 0, 1, ema_buf) < 1) return false;
-   double ema = ema_buf[0];
-   double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   if(buySignal) return (price > ema);
-   else return (price < ema);
-}
-
-//+------------------------------------------------------------------+
-//| Main tick function                                              |
+//| Tick function                                                   |
 //+------------------------------------------------------------------+
 void OnTick() {
-   // --- Daily limits & reset ---
+   // --- Daily profit limits ---
    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    dailyProfit = currentBalance - startBalance;
    if(dailyProfit >= DailyTargetUSD) {
@@ -215,7 +178,7 @@ void OnTick() {
       return;
    }
    
-   // --- Time filter ---
+   // --- Simple time filter (optional, disabled by default) ---
    if(UseTimeFilter) {
       MqlDateTime dt;
       TimeToStruct(TimeCurrent(), dt);
@@ -223,18 +186,11 @@ void OnTick() {
       if(hour < StartHour || hour > EndHour) return;
    }
    
-   // --- Spread filter ---
+   // --- Spread filter (tolerant) ---
    int spread = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
    if(spread > MaxSpreadPoints) return;
    
-   // --- ATR volatility filter ---
-   if(UseATRVolatilityFilter) {
-      if(CopyBuffer(atr_handle, 0, 0, 1, atr_buf) < 1) return;
-      double atrPoints = atr_buf[0] / _Point;
-      if(atrPoints < MinATRValuePoints) return;  // market too quiet – skip
-   }
-   
-   // --- Position limit & cooldown ---
+   // --- Position limit & cooldown (very short)---
    int posCount = 0;
    for(int i = PositionsTotal()-1; i >= 0; i--) {
       ulong ticket = PositionGetTicket(i);
@@ -242,14 +198,15 @@ void OnTick() {
          posCount++;
    }
    if(posCount >= MaxConcurrentTrades) return;
-   if(TimeCurrent() - lastTradeTime < 1) return;
+   if(TimeCurrent() - lastTradeTime < 0.3) return;   // 0.3 sec cooldown -> up to 3 trades/sec max
    
-   // --- Get prices ---
+   // --- Get current prices ---
    double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   if(point == 0) return;
    
-   // --- Tick reversal pattern detection ---
+   // --- Tick reversal pattern (pure logic) ---
    if(lastPrice != 0) {
       double movePoints = (currentBid - lastPrice) / point;
       if(MathAbs(movePoints) >= MinTickMovementPoints) {
@@ -276,64 +233,57 @@ void OnTick() {
          reversalCounter = 0;
       }
       
-      // Signal when reversal confirmed
+      // Trigger trade when reversal confirmed
       if(waitingForReversal && reversalCounter >= ReversalTicksRequired) {
          bool buySignal = (consecutiveDownTicks >= ConsecutiveTicksNeeded);
          bool sellSignal = (consecutiveUpTicks >= ConsecutiveTicksNeeded);
          
-         // Apply extra filters
-         if(buySignal && RSIConfirms(true) && TrendFilter(true)) {
-            ExecuteTrade(ORDER_TYPE_BUY, currentAsk);
-            ResetPatternCounters();
-         } else if(sellSignal && RSIConfirms(false) && TrendFilter(false)) {
-            ExecuteTrade(ORDER_TYPE_SELL, currentBid);
-            ResetPatternCounters();
+         if(buySignal || sellSignal) {
+            double slPoints, tpPoints;
+            GetTPSL(slPoints, tpPoints);
+            
+            double sl = 0, tp = 0;
+            double price = 0;
+            if(buySignal) {
+               price = currentAsk;
+               sl = price - slPoints * point;
+               tp = price + tpPoints * point;
+            } else {
+               price = currentBid;
+               sl = price + slPoints * point;
+               tp = price - tpPoints * point;
+            }
+            int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+            sl = NormalizeDouble(sl, digits);
+            tp = NormalizeDouble(tp, digits);
+            
+            double lot = (UseFixedLot) ? FixedLotSize : CalculateRiskBasedLot(slPoints);
+            lot = MathMax(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN), lot);
+            
+            bool result = false;
+            if(buySignal)
+               result = trade.Buy(lot, _Symbol, price, sl, tp, "TickBuy");
+            else
+               result = trade.Sell(lot, _Symbol, price, sl, tp, "TickSell");
+            
+            if(result) {
+               Print("🔥 ", buySignal ? "BUY" : "SELL", 
+                     " | ticks: ", buySignal ? consecutiveDownTicks : consecutiveUpTicks,
+                     "→", reversalCounter, " | Lot=", lot, " | TP=", tpPoints/10.0, "pips");
+               lastTradeTime = TimeCurrent();
+               tradeCountToday++;
+               ResetPatternCounters();
+            } else {
+               Print("❌ Order failed. Error: ", GetLastError());
+            }
          }
       }
    }
    
    lastPrice = currentBid;
    
-   // --- Manage open positions (breakeven & trailing) ---
-   ManageOpenPositions();
-}
-
-//+------------------------------------------------------------------+
-//| Execute a trade with dynamic TP/SL                              |
-//+------------------------------------------------------------------+
-void ExecuteTrade(int orderType, double price) {
-   double slPoints, tpPoints;
-   GetDynamicTPSL(slPoints, tpPoints);
-   
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double sl = 0, tp = 0;
-   if(orderType == ORDER_TYPE_BUY) {
-      sl = price - slPoints * point;
-      tp = price + tpPoints * point;
-   } else {
-      sl = price + slPoints * point;
-      tp = price - tpPoints * point;
-   }
-   sl = NormalizeDouble(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-   tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-   
-   double lot = (UseFixedLot) ? FixedLotSize : CalculateRiskBasedLot(slPoints);
-   lot = MathMax(0.01, lot);
-   
-   bool result = false;
-   if(orderType == ORDER_TYPE_BUY)
-      result = trade.Buy(lot, _Symbol, price, sl, tp, "TickProBuy");
-   else
-      result = trade.Sell(lot, _Symbol, price, sl, tp, "TickProSell");
-   
-   if(result) {
-      Print("🔥 ", orderType == ORDER_TYPE_BUY ? "BUY" : "SELL", 
-            " | Lot=", lot, " | TP=", tpPoints/10.0, "pips | SL=", slPoints/10.0, "pips");
-      lastTradeTime = TimeCurrent();
-      tradeCountToday++;
-   } else {
-      Print("❌ Order failed. Error: ", GetLastError());
-   }
+   // --- Trailing stop for open positions ---
+   if(UseTrailingStop) ApplyTrailingStop();
 }
 
 //+------------------------------------------------------------------+
@@ -343,6 +293,7 @@ double CalculateRiskBasedLot(double slPoints) {
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double riskAmount = balance * RiskPercent / 100.0;
    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   if(tickValue <= 0 || slPoints <= 0) return 0.01;
    double riskPerLot = slPoints * tickValue;
    double lot = (riskPerLot > 0) ? riskAmount / riskPerLot : 0.01;
    
@@ -350,21 +301,21 @@ double CalculateRiskBasedLot(double slPoints) {
    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
    lot = MathMax(minLot, MathMin(maxLot, lot));
-   lot = MathRound(lot / stepLot) * stepLot;
+   if(stepLot > 0) lot = MathRound(lot / stepLot) * stepLot;
    return lot;
 }
 
 //+------------------------------------------------------------------+
-//| Breakeven stop and trailing stop                                |
+//| Apply trailing stop                                             |
 //+------------------------------------------------------------------+
-void ManageOpenPositions() {
+void ApplyTrailingStop() {
    for(int i = PositionsTotal()-1; i >= 0; i--) {
       ulong ticket = PositionGetTicket(i);
       if(!PositionSelectByTicket(ticket)) continue;
       if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
       
-      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
       double currentSL = PositionGetDouble(POSITION_SL);
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
       double currentTP = PositionGetDouble(POSITION_TP);
       double currentPrice = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ?
                             SymbolInfoDouble(_Symbol, SYMBOL_BID) :
@@ -373,14 +324,6 @@ void ManageOpenPositions() {
       if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
          profitPoints = -profitPoints;
       
-      // Breakeven stop
-      if(UseBreakevenStop && profitPoints >= BreakevenTriggerPts && currentSL == 0) {
-         double newSL = openPrice;
-         if(trade.PositionModify(ticket, newSL, currentTP))
-            Print("🔒 Breakeven activated for ticket ", ticket);
-      }
-      
-      // Trailing stop (only if beyond breakeven or custom)
       if(UseTrailingStop && profitPoints >= TrailingStartPts) {
          double newSL = 0;
          if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) {
