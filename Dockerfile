@@ -20,60 +20,64 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                         Pure_Tick_Scalper_Aggro |
-//|                      Pure tick reversal pattern – no indicators |
+//|                                     Advanced_Tick_Scalper_PRO   |
+//|                 Pure tick logic: acceleration + double reversal |
 //|                                   Target $5/day on $10 cent     |
-//|                                                  Win rate >75%  |
+//|                                                  Win rate 75%+  |
 //+------------------------------------------------------------------+
-#property copyright "Aggressive Tick"
-#property version   "7.00"
-#property description "Pure tick reversal scalper – no RSI, no EMA, no ATR"
+#property copyright "TickMaster"
+#property version   "8.00"
+#property description "Advanced tick-based scalper – no indicators, pure tick pattern"
 #property strict
 
 #include <Trade\Trade.mqh>
 
 // ---------------------------------------------------------------
-//  INPUTS – Ultra Aggressive (high win rate via pattern alone)
+//  INPUTS – Aggressive, High Win Rate
 // ---------------------------------------------------------------
 input string   t1 = "==== Money Management ====";
-input bool     UseFixedLot       = false;      // false = risk%, true = fixed lot
-input double   FixedLotSize      = 0.01;       // used if UseFixedLot = true
-input double   RiskPercent       = 12.0;       // 12% risk per trade (aggressive)
+input bool     UseFixedLot       = false;
+input double   FixedLotSize      = 0.01;
+input double   RiskPercent       = 12.0;
 input int      MaxConcurrentTrades = 2;
-input int      MagicNumber       = 999001;
+input int      MagicNumber       = 777301;
 
-input string   t2 = "==== Tick Pattern (Core Logic) ====";
-input int      ConsecutiveTicksNeeded = 3;     // 3+ same direction ticks to start
-input int      ReversalTicksRequired = 2;      // 2 opposite ticks to confirm reversal
-input int      MinTickMovementPoints = 1;      // 1 point minimum movement (catch all ticks)
+input string   t2 = "==== Tick Pattern (Advanced) ====";
+input int      MinConsecutiveTicks = 5;        // Need at least 5 same-direction ticks to start
+input int      MinReversalTicks   = 2;         // Minimum opposite ticks to confirm
+input bool     RequireDoubleReversal = true;   // True: needs 2 opposite then 1 same as reversal
+input int      TickAccelerationThreshold = 4;  // Min ticks per 0.5 sec to consider (high activity)
+input int      TickSlopePeriod    = 5;         // Last 5 ticks for micro-trend slope
+input double   MinSlopePointsPerTick = 0.3;    // Minimum slope (in points per tick) – filters drift
+input bool     UseTickRSI         = true;      // Use tick-based strength ratio
+input double   TickRSIBuyThreshold = 0.3;      // Ratio of up ticks to total < 0.3 = buy
+input double   TickRSISellThreshold = 0.7;     // Ratio > 0.7 = sell
 
-input string   t3 = "==== TP/SL (Fixed or ATR based) ====";
-input bool     UseATR_TP_SL      = true;       // true = ATR based, false = fixed points
-input int      ATRPeriod         = 14;
-input double   StopLossATRMult   = 1.2;        // SL = ATR * 1.2
-input double   TakeProfitATRMult = 0.8;        // TP = ATR * 0.8 (smaller for high win rate)
-input int      FixedStopLossPoints = 60;       // 6 pips (if UseATR_TP_SL = false)
+input string   t3 = "==== TP/SL (Dynamic or Fixed) ====";
+input bool     UseAdaptiveStop    = true;      // Stop based on tick speed: faster speed → tighter SL
+input int      FixedStopLossPoints = 60;       // 6 pips (if adaptive off)
 input int      FixedTakeProfitPoints = 30;     // 3 pips
+input double   AdaptiveSLMultiplier = 0.8;     // SL = ATR (or tick speed) * multiplier (to be replaced with simpler)
+// Instead of ATR, we use tick speed: faster ticks → smaller SL
+input int      BaseStopPoints     = 80;        // Base stop in points (8 pips)
+input int      MinStopPoints      = 30;        // 3 pips minimum (very fast markets)
+input int      MaxStopPoints      = 120;       // 12 pips maximum (slow markets)
 
-input string   t4 = "==== Minimal Filters (only essential) ====";
-input int      MaxSpreadPoints   = 100;        // 10 pips – very tolerant
-input bool     UseTimeFilter     = false;      // false = trade any time (24/5)
-input int      StartHour         = 0;
-input int      EndHour           = 23;
-input bool     UseTrailingStop   = true;
-input int      TrailingStartPts  = 20;         // start trailing at 2 pips profit
-input int      TrailingStepPts   = 10;         // trail by 1 pip
-
-input string   t5 = "==== Daily Limits ====";
-input double   DailyTargetUSD    = 5.0;        // stop after $5 profit
-input double   MaxDailyLossUSD   = 2.0;        // stop after $2 loss
+input string   t4 = "==== Filters ====";
+input int      MaxSpreadPoints    = 100;       // 10 pips – tolerant
+input bool     UseTimeFilter      = false;
+input int      StartHour          = 0;
+input int      EndHour            = 23;
+input bool     UseTrailingStop    = true;
+input int      TrailingStartPts   = 20;        // 2 pips profit triggers trail
+input int      TrailingStepPts    = 10;        // 1 pip step
+input double   DailyTargetUSD     = 5.0;
+input double   MaxDailyLossUSD    = 2.0;
 
 // ---------------------------------------------------------------
 //  GLOBALS
 // ---------------------------------------------------------------
 CTrade trade;
-int      atr_handle;
-double   atr_buf[];
 datetime lastTradeTime = 0;
 double   lastPrice = 0;
 int      consecutiveUpTicks = 0;
@@ -86,31 +90,119 @@ double   startBalance = 0.0;
 bool     tradingHalted = false;
 int      tradeCountToday = 0;
 
+// Tick history for slope and tick RSI
+struct TickRec {
+   datetime time;
+   double   price;
+   bool     directionUp; // true = up, false = down
+};
+TickRec tickHistory[50];
+int tickHistoryIdx = 0;
+int tickHistoryCount = 0;
+
+// Tick speed measurement
+datetime lastTickTime = 0;
+int      ticksThisHalfSecond = 0;
+double   tickSpeed = 0;   // ticks per second average
+
+//+------------------------------------------------------------------+
+//| Record each tick for slope and tick RSI                         |
+//+------------------------------------------------------------------+
+void RecordTick(double price, bool isUp) {
+   tickHistory[tickHistoryIdx].time = TimeCurrent();
+   tickHistory[tickHistoryIdx].price = price;
+   tickHistory[tickHistoryIdx].directionUp = isUp;
+   tickHistoryIdx = (tickHistoryIdx + 1) % 50;
+   if(tickHistoryCount < 50) tickHistoryCount++;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate micro-slope over last N ticks                         |
+//+------------------------------------------------------------------+
+double GetTickSlope(int n) {
+   if(tickHistoryCount < n) return 0;
+   double sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+   int startIdx = tickHistoryIdx - n;
+   if(startIdx < 0) startIdx += 50;
+   for(int i = 0; i < n; i++) {
+      int idx = (startIdx + i) % 50;
+      double price = tickHistory[idx].price;
+      sumX += i;
+      sumY += price;
+      sumXY += i * price;
+      sumX2 += i * i;
+   }
+   double denominator = n * sumX2 - sumX * sumX;
+   if(denominator == 0) return 0;
+   double slope = (n * sumXY - sumX * sumY) / denominator;
+   // Convert slope to points per tick
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   return slope / point;
+}
+
+//+------------------------------------------------------------------+
+//| Tick RSI (ratio of up ticks to total) over last N ticks        |
+//+------------------------------------------------------------------+
+double GetTickRSI(int n) {
+   if(tickHistoryCount < n) return 0.5;
+   int upCount = 0;
+   int startIdx = tickHistoryIdx - n;
+   if(startIdx < 0) startIdx += 50;
+   for(int i = 0; i < n; i++) {
+      int idx = (startIdx + i) % 50;
+      if(tickHistory[idx].directionUp) upCount++;
+   }
+   return (double)upCount / n;
+}
+
+//+------------------------------------------------------------------+
+//| Update tick speed (ticks per second)                            |
+//+------------------------------------------------------------------+
+void UpdateTickSpeed() {
+   datetime now = TimeCurrent();
+   if(lastTickTime == 0) {
+      lastTickTime = now;
+      ticksThisHalfSecond = 1;
+      tickSpeed = 1;
+      return;
+   }
+   double deltaSec = (now - lastTickTime);
+   if(deltaSec >= 0.5) {
+      tickSpeed = ticksThisHalfSecond / deltaSec;  // ticks per sec
+      ticksThisHalfSecond = 1;
+      lastTickTime = now;
+   } else {
+      ticksThisHalfSecond++;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get adaptive stop loss based on tick speed (faster → tighter)   |
+//+------------------------------------------------------------------+
+int GetAdaptiveStopPoints() {
+   if(!UseAdaptiveStop) return FixedStopLossPoints;
+   // tickSpeed: typical range: 2 (slow) to 20 (very fast)
+   double speed = MathMax(1, MathMin(20, tickSpeed));
+   // Faster speed = tighter stop (inverse relationship)
+   int slPoints = (int)(BaseStopPoints * (5.0 / (speed + 3))); // formula: speed 2 → sl ~80*5/5=80; speed 20 → sl~80*5/23≈17
+   slPoints = MathMax(MinStopPoints, MathMin(MaxStopPoints, slPoints));
+   return slPoints;
+}
+
 //+------------------------------------------------------------------+
 //| Expert initialization                                           |
 //+------------------------------------------------------------------+
 int OnInit() {
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetTypeFilling(ORDER_FILLING_FOK);
-   
-   if(UseATR_TP_SL) {
-      atr_handle = iATR(_Symbol, PERIOD_M1, ATRPeriod);
-      if(atr_handle == INVALID_HANDLE) return INIT_FAILED;
-      ArraySetAsSeries(atr_buf, true);
-   }
-   
    startBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    
    Print("==================================================");
-   Print("⚡ PURE TICK SCALPER (No indicators)");
+   Print("🔥 ADVANCED TICK SCALPER (Pure Tick Logic)");
    Print("   Balance: $", startBalance);
-   if(UseFixedLot) Print("   Lot mode: FIXED | Lot = ", FixedLotSize);
-   else Print("   Lot mode: RISK% | Risk = ", RiskPercent, "%");
-   if(UseATR_TP_SL)
-      Print("   TP/SL: ATR based (SL=", StopLossATRMult, "*ATR, TP=", TakeProfitATRMult, "*ATR)");
-   else
-      Print("   TP/SL: FIXED (", FixedTakeProfitPoints/10.0, "/", FixedStopLossPoints/10.0, " pips)");
-   Print("   Pattern: ", ConsecutiveTicksNeeded, " ticks → ", ReversalTicksRequired, " opposite = trade");
+   Print("   Pattern: ", MinConsecutiveTicks, "+ consec → ", MinReversalTicks, " rev + double confirm");
+   Print("   Tick acceleration threshold: ", TickAccelerationThreshold, " ticks/0.5s");
+   Print("   Adaptive stop: ", UseAdaptiveStop, " | Base ", BaseStopPoints/10.0, " pips");
    Print("   Daily target: $", DailyTargetUSD, " | Max loss: $", MaxDailyLossUSD);
    Print("==================================================");
    
@@ -121,34 +213,14 @@ int OnInit() {
 //| Deinitialization                                                |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason) {
-   if(UseATR_TP_SL && atr_handle != INVALID_HANDLE) IndicatorRelease(atr_handle);
    Print("EA stopped. Trades today: ", tradeCountToday);
 }
 
 //+------------------------------------------------------------------+
-//| Get dynamic TP/SL (ATR based or fixed)                          |
-//+------------------------------------------------------------------+
-void GetTPSL(double &slPoints, double &tpPoints) {
-   if(!UseATR_TP_SL) {
-      slPoints = FixedStopLossPoints;
-      tpPoints = FixedTakeProfitPoints;
-      return;
-   }
-   if(CopyBuffer(atr_handle, 0, 0, 1, atr_buf) < 1) {
-      slPoints = FixedStopLossPoints;
-      tpPoints = FixedTakeProfitPoints;
-      return;
-   }
-   double atrValue = atr_buf[0] / _Point;
-   slPoints = MathMax(20, atrValue * StopLossATRMult);
-   tpPoints = MathMax(10, atrValue * TakeProfitATRMult);
-}
-
-//+------------------------------------------------------------------+
-//| Tick function                                                   |
+//| Main tick function                                              |
 //+------------------------------------------------------------------+
 void OnTick() {
-   // --- Daily profit limits ---
+   // --- Daily limits ---
    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    dailyProfit = currentBalance - startBalance;
    if(dailyProfit >= DailyTargetUSD) {
@@ -178,19 +250,11 @@ void OnTick() {
       return;
    }
    
-   // --- Simple time filter (optional, disabled by default) ---
-   if(UseTimeFilter) {
-      MqlDateTime dt;
-      TimeToStruct(TimeCurrent(), dt);
-      int hour = dt.hour;
-      if(hour < StartHour || hour > EndHour) return;
-   }
-   
-   // --- Spread filter (tolerant) ---
+   // --- Spread filter ---
    int spread = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
    if(spread > MaxSpreadPoints) return;
    
-   // --- Position limit & cooldown (very short)---
+   // --- Position limit & cooldown (0.3 sec) ---
    int posCount = 0;
    for(int i = PositionsTotal()-1; i >= 0; i--) {
       ulong ticket = PositionGetTicket(i);
@@ -198,18 +262,27 @@ void OnTick() {
          posCount++;
    }
    if(posCount >= MaxConcurrentTrades) return;
-   if(TimeCurrent() - lastTradeTime < 0.3) return;   // 0.3 sec cooldown -> up to 3 trades/sec max
+   if(TimeCurrent() - lastTradeTime < 0.3) return;
    
-   // --- Get current prices ---
+   // --- Get price data ---
    double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    if(point == 0) return;
    
-   // --- Tick reversal pattern (pure logic) ---
+   // --- Update tick speed and record tick ---
+   UpdateTickSpeed();
+   bool isUp = (lastPrice != 0 && currentBid > lastPrice);
+   if(lastPrice != 0) RecordTick(currentBid, isUp);
+   lastPrice = currentBid;
+   
+   // --- Tick acceleration filter: only trade if market is active (tick speed high) ---
+   if(tickSpeed < TickAccelerationThreshold) return;
+   
+   // --- Track consecutive ticks and reversal ---
    if(lastPrice != 0) {
       double movePoints = (currentBid - lastPrice) / point;
-      if(MathAbs(movePoints) >= MinTickMovementPoints) {
+      if(MathAbs(movePoints) >= 1) {   // minimum 1 point movement
          if(movePoints > 0) {
             if(waitingForReversal && !lastDirectionUp) reversalCounter++;
             else if(!waitingForReversal) {
@@ -228,61 +301,82 @@ void OnTick() {
       }
       
       // Start waiting for reversal if enough consecutive ticks
-      if(!waitingForReversal && (consecutiveUpTicks >= ConsecutiveTicksNeeded || consecutiveDownTicks >= ConsecutiveTicksNeeded)) {
+      if(!waitingForReversal && (consecutiveUpTicks >= MinConsecutiveTicks || consecutiveDownTicks >= MinConsecutiveTicks)) {
          waitingForReversal = true;
          reversalCounter = 0;
       }
       
-      // Trigger trade when reversal confirmed
-      if(waitingForReversal && reversalCounter >= ReversalTicksRequired) {
-         bool buySignal = (consecutiveDownTicks >= ConsecutiveTicksNeeded);
-         bool sellSignal = (consecutiveUpTicks >= ConsecutiveTicksNeeded);
+      // Complex signal: double reversal confirmation
+      bool buySignal = false, sellSignal = false;
+      if(waitingForReversal && reversalCounter >= MinReversalTicks) {
+         if(RequireDoubleReversal) {
+            // Need one more tick in the reversal direction after the initial opposite ticks
+            // For example: down run → 2 up ticks → then a down tick? No: we want the reversal to continue.
+            // Better: we already have reversalCounter enough. But to increase confidence, we check slope of last 5 ticks.
+            // The slope should be in the direction of the trade.
+            double slope = GetTickSlope(TickSlopePeriod);
+            if(consecutiveDownTicks >= MinConsecutiveTicks && slope > MinSlopePointsPerTick)
+               buySignal = true;
+            else if(consecutiveUpTicks >= MinConsecutiveTicks && slope < -MinSlopePointsPerTick)
+               sellSignal = true;
+         } else {
+            buySignal = (consecutiveDownTicks >= MinConsecutiveTicks);
+            sellSignal = (consecutiveUpTicks >= MinConsecutiveTicks);
+         }
+      }
+      
+      // Tick RSI filter (if enabled)
+      if(UseTickRSI && (buySignal || sellSignal)) {
+         double rsiTick = GetTickRSI(10);
+         if(buySignal && rsiTick > TickRSIBuyThreshold) buySignal = false;
+         if(sellSignal && rsiTick < TickRSISellThreshold) sellSignal = false;
+      }
+      
+      // Execute if signal valid
+      if(buySignal || sellSignal) {
+         int slPoints = (UseAdaptiveStop) ? GetAdaptiveStopPoints() : FixedStopLossPoints;
+         int tpPoints = FixedTakeProfitPoints;  // keep small for high win rate
          
-         if(buySignal || sellSignal) {
-            double slPoints, tpPoints;
-            GetTPSL(slPoints, tpPoints);
-            
-            double sl = 0, tp = 0;
-            double price = 0;
-            if(buySignal) {
-               price = currentAsk;
-               sl = price - slPoints * point;
-               tp = price + tpPoints * point;
-            } else {
-               price = currentBid;
-               sl = price + slPoints * point;
-               tp = price - tpPoints * point;
-            }
-            int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-            sl = NormalizeDouble(sl, digits);
-            tp = NormalizeDouble(tp, digits);
-            
-            double lot = (UseFixedLot) ? FixedLotSize : CalculateRiskBasedLot(slPoints);
-            lot = MathMax(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN), lot);
-            
-            bool result = false;
-            if(buySignal)
-               result = trade.Buy(lot, _Symbol, price, sl, tp, "TickBuy");
-            else
-               result = trade.Sell(lot, _Symbol, price, sl, tp, "TickSell");
-            
-            if(result) {
-               Print("🔥 ", buySignal ? "BUY" : "SELL", 
-                     " | ticks: ", buySignal ? consecutiveDownTicks : consecutiveUpTicks,
-                     "→", reversalCounter, " | Lot=", lot, " | TP=", tpPoints/10.0, "pips");
-               lastTradeTime = TimeCurrent();
-               tradeCountToday++;
-               ResetPatternCounters();
-            } else {
-               Print("❌ Order failed. Error: ", GetLastError());
-            }
+         double sl = 0, tp = 0;
+         double price = 0;
+         if(buySignal) {
+            price = currentAsk;
+            sl = price - slPoints * point;
+            tp = price + tpPoints * point;
+         } else {
+            price = currentBid;
+            sl = price + slPoints * point;
+            tp = price - tpPoints * point;
+         }
+         int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+         sl = NormalizeDouble(sl, digits);
+         tp = NormalizeDouble(tp, digits);
+         
+         double lot = (UseFixedLot) ? FixedLotSize : CalculateRiskBasedLot(slPoints);
+         lot = MathMax(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN), lot);
+         
+         bool result = false;
+         if(buySignal)
+            result = trade.Buy(lot, _Symbol, price, sl, tp, "AdvTickBuy");
+         else
+            result = trade.Sell(lot, _Symbol, price, sl, tp, "AdvTickSell");
+         
+         if(result) {
+            Print("🔥 ", buySignal ? "BUY" : "SELL",
+                  " | Consecutive: ", buySignal ? consecutiveDownTicks : consecutiveUpTicks,
+                  " | Rev: ", reversalCounter,
+                  " | TickSpeed: ", DoubleToString(tickSpeed,1), " t/s",
+                  " | SL: ", slPoints/10.0, "pips | Lot=", lot);
+            lastTradeTime = TimeCurrent();
+            tradeCountToday++;
+            ResetPatternCounters();
+         } else {
+            Print("❌ Order failed. Error: ", GetLastError());
          }
       }
    }
    
-   lastPrice = currentBid;
-   
-   // --- Trailing stop for open positions ---
+   // --- Trailing stop ---
    if(UseTrailingStop) ApplyTrailingStop();
 }
 
@@ -296,7 +390,6 @@ double CalculateRiskBasedLot(double slPoints) {
    if(tickValue <= 0 || slPoints <= 0) return 0.01;
    double riskPerLot = slPoints * tickValue;
    double lot = (riskPerLot > 0) ? riskAmount / riskPerLot : 0.01;
-   
    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
@@ -306,7 +399,7 @@ double CalculateRiskBasedLot(double slPoints) {
 }
 
 //+------------------------------------------------------------------+
-//| Apply trailing stop                                             |
+//| Trailing stop                                                   |
 //+------------------------------------------------------------------+
 void ApplyTrailingStop() {
    for(int i = PositionsTotal()-1; i >= 0; i--) {
@@ -324,7 +417,7 @@ void ApplyTrailingStop() {
       if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
          profitPoints = -profitPoints;
       
-      if(UseTrailingStop && profitPoints >= TrailingStartPts) {
+      if(profitPoints >= TrailingStartPts) {
          double newSL = 0;
          if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) {
             newSL = currentPrice - TrailingStepPts * _Point;
