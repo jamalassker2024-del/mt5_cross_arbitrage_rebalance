@@ -22,12 +22,12 @@ RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
 //|                                      ECB_Arbitrage_Aggressor.mq5 |
 //|                     Uses ECB official rates as lead data feed   |
+//|                     Fixed JSON parsing - no external libraries  |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
-#include <JSON.mqh>  // You'll need the JSON parser library
 
 #property copyright "Omni-Apex ECB Arbitrage"
-#property version   "4.00"
+#property version   "4.20"
 #property strict
 
 // --- INPUTS --------------------------------------------------------+
@@ -35,13 +35,14 @@ input string   BaseCurrency           = "EUR";
 input string   QuoteCurrency1         = "CHF";      // Primary arbitrage pair
 input string   QuoteCurrency2         = "USD";      // Validation pair
 input double   RiskPercent            = 3.0;        // % of equity per trade
-input int      MinMispricingPoints    = 10;         // Minimum mispricing in points to trigger
-input int      MaxOpenPositions       = 3;          // Concurrent trades limit
+input int      MinMispricingPoints    = 10;         // Minimum mispricing in points
+input int      MaxOpenPositions       = 3;
 input int      MagicNumber            = 999888;
-input double   MinProfitUSD           = 1.00;       // Minimum profit to close
-input double   TrailingLockStep       = 0.15;       // Lock profit every $0.15 above min
-input int      MaxConsecutiveLosses   = 3;          // Stop after N losses in a row
-input double   MaxDailyLossPercent    = 8.0;        // Stop trading after -8% equity loss per day
+input double   MinProfitUSD           = 1.00;
+input double   TrailingLockStep       = 0.15;
+input int      MaxConsecutiveLosses   = 3;
+input double   MaxDailyLossPercent    = 8.0;
+input bool     DebugPrintResponse     = false;      // Set to true to see raw JSON in Experts tab
 
 // --- GLOBALS -------------------------------------------------------+
 CTrade trade;
@@ -54,36 +55,45 @@ double dailyLoss = 0;
 bool tradingEnabled = true;
 int consecutiveLosses = 0;
 
-// For profit trailing
 ulong   lockTickets[];
 double  lockValues[];
 
 //+------------------------------------------------------------------+
-//| Expert initialization                                           |
+//| Robust JSON value extractor - finds first number after a key    |
 //+------------------------------------------------------------------+
-int OnInit() {
-   // ECB API endpoint: returns latest EUR/CHF and EUR/USD rates
-   // This uses the official ECB Data Portal API – free, no API key required
-   ecb_url = "https://data-api.ecb.europa.eu/service/data/EXR/D.CHF+USD.EUR.SP00.A?format=jsondata&lastNObservations=1";
+double ExtractJsonNumber(string json, string key) {
+   // Find the key (e.g., "0:0:0:0:0" or "0:0:0:0:1")
+   int keyPos = StringFind(json, key);
+   if (keyPos == -1) return -1;
    
-   trade.SetExpertMagicNumber(MagicNumber);
-   trade.SetTypeFilling(ORDER_FILLING_IOC);
-   SymbolSelect(_Symbol, true);
-   dayStart = TimeCurrent();
-   dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
+   // Search for a colon after the key
+   int colonPos = StringFind(json, ":", keyPos);
+   if (colonPos == -1) return -1;
    
-   Print("==============================================");
-   Print("🏦 ECB ARBITRAGE AGRESSOR - OFFICIAL RATES");
-   Print("   Pair: ", BaseCurrency, "/", QuoteCurrency1);
-   Print("   ECB API: ", ecb_url);
-   Print("   MinMispricing: ", MinMispricingPoints, " pts | MinProfit: $", MinProfitUSD);
-   Print("==============================================");
-   return(INIT_SUCCEEDED);
+   // Look for the start of the numeric value (skip any quotes or braces)
+   int start = colonPos + 1;
+   while (start < StringLen(json) && (StringSubstr(json, start, 1) == "\"" || 
+          StringSubstr(json, start, 1) == " " || 
+          StringSubstr(json, start, 1) == "{" ||
+          StringSubstr(json, start, 1) == "[")) start++;
+   
+   // Now collect numeric characters (digits, decimal point, minus sign)
+   string numStr = "";
+   for (int i = start; i < StringLen(json); i++) {
+      string ch = StringSubstr(json, i, 1);
+      if ((ch >= "0" && ch <= "9") || ch == "." || ch == "-") {
+         numStr += ch;
+      } else {
+         break;
+      }
+   }
+   
+   if (numStr == "") return -1;
+   return StringToDouble(numStr);
 }
 
 //+------------------------------------------------------------------+
-//| Fetch ECB exchange rates (official, daily at ~16:00 CET)        |
-//| Returns true and fills passed references                        |
+//| Fetch ECB exchange rates                                         |
 //+------------------------------------------------------------------+
 bool FetchECBRates(double &ecb_chf_rate, double &ecb_usd_rate) {
    char post[], result[];
@@ -97,35 +107,65 @@ bool FetchECBRates(double &ecb_chf_rate, double &ecb_usd_rate) {
    
    string response = CharArrayToString(result);
    
-   // Parse JSON to extract the latest observation values
-   // The response structure contains dataSets -> series -> observations
-   // This is a simplified parser; for production, use a full JSON library
+   // Optional debug: print first 500 chars of response
+   if (DebugPrintResponse && TimeCurrent() % 30 == 0) {
+      Print("ECB Response (first 500 chars): ", StringSubstr(response, 0, 500));
+   }
    
-   int chfPos = StringFind(response, "\"0:0:0:0:0\":{\"0\":");
-   int usdPos = StringFind(response, "\"0:0:0:0:1\":{\"0\":");
+   // The ECB response contains two series: CHF (0:0:0:0:0) and USD (0:0:0:0:1)
+   // We need to find the latest observation value for each.
+   // Different ECB endpoints may have slightly different keys. Try multiple patterns.
    
-   if (chfPos < 0 || usdPos < 0) {
-      Print("❌ Failed to parse ECB response. Retrying next tick.");
+   ecb_chf_rate = ExtractJsonNumber(response, "\"0:0:0:0:0\"");
+   if (ecb_chf_rate <= 0) {
+      // Try alternative pattern (some endpoints use "0:0:0:0:0:0")
+      ecb_chf_rate = ExtractJsonNumber(response, "\"0:0:0:0:0:0\"");
+   }
+   
+   ecb_usd_rate = ExtractJsonNumber(response, "\"0:0:0:0:1\"");
+   if (ecb_usd_rate <= 0) {
+      ecb_usd_rate = ExtractJsonNumber(response, "\"0:0:0:0:1:0\"");
+   }
+   
+   // If still not found, try searching for "value" field (common in some ECB responses)
+   if (ecb_chf_rate <= 0) ecb_chf_rate = ExtractJsonNumber(response, "\"value\"");
+   if (ecb_usd_rate <= 0) ecb_usd_rate = ExtractJsonNumber(response, "\"value\"");
+   
+   if (ecb_chf_rate <= 0 || ecb_usd_rate <= 0) {
+      static int parseFail = 0;
+      if (parseFail++ % 20 == 0) {
+         Print("❌ Failed to parse ECB response. Raw preview: ", StringSubstr(response, 0, 300));
+      }
       return false;
    }
    
-   // Extract CHF rate
-   int chfValStart = StringFind(response, ":", chfPos) + 1;
-   int chfValEnd   = StringFind(response, ",", chfValStart);
-   string chfStr = StringSubstr(response, chfValStart, chfValEnd - chfValStart);
-   ecb_chf_rate = StringToDouble(chfStr);
-   
-   // Extract USD rate
-   int usdValStart = StringFind(response, ":", usdPos) + 1;
-   int usdValEnd   = StringFind(response, "}", usdValStart);
-   string usdStr = StringSubstr(response, usdValStart, usdValEnd - usdValStart);
-   ecb_usd_rate = StringToDouble(usdStr);
-   
-   return (ecb_chf_rate > 0 && ecb_usd_rate > 0);
+   return true;
 }
 
 //+------------------------------------------------------------------+
-//| Helper for trailing profit management                            |
+//| Expert initialization                                           |
+//+------------------------------------------------------------------+
+int OnInit() {
+   // ECB API endpoint (last 1 observation for CHF and USD against EUR)
+   ecb_url = "https://data-api.ecb.europa.eu/service/data/EXR/D.CHF+USD.EUR.SP00.A?format=jsondata&lastNObservations=1";
+   
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetTypeFilling(ORDER_FILLING_IOC);
+   SymbolSelect(_Symbol, true);
+   dayStart = TimeCurrent();
+   dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
+   
+   Print("==============================================");
+   Print("🏦 ECB ARBITRAGE EA - FIXED PARSING");
+   Print("   Pair: ", BaseCurrency, "/", QuoteCurrency1);
+   Print("   API: ", ecb_url);
+   Print("   MinMispricing: ", MinMispricingPoints, " pts | MinProfit: $", MinProfitUSD);
+   Print("==============================================");
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Trailing lock helpers (same as before)                          |
 //+------------------------------------------------------------------+
 int FindLockIndex(ulong ticket) {
    for (int i = 0; i < ArraySize(lockTickets); i++)
@@ -155,15 +195,14 @@ void AddLock(ulong ticket, double lockValue) {
 //| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick() {
-   // --- DAILY LOSS RESET ---
+   // Daily reset and loss limit (same as before)
    if (TimeCurrent() - dayStart >= 86400) {
       dayStart = TimeCurrent();
       dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
       tradingEnabled = true;
-      Print("✅ New trading day. Loss counter reset.");
+      Print("✅ New trading day.");
    }
    
-   // --- DAILY LOSS CHECK ---
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
    double lossPercent = (dailyEquityStart - equity) / dailyEquityStart * 100.0;
    if (lossPercent >= MaxDailyLossPercent) {
@@ -174,11 +213,10 @@ void OnTick() {
       return;
    } else if (!tradingEnabled && lossPercent < MaxDailyLossPercent - 2) {
       tradingEnabled = true;
-      Print("✅ Daily loss recovered. Trading re-enabled.");
    }
    if (!tradingEnabled) return;
    
-   // --- CLOSE POSITIONS WITH TRAILING PROFIT LOCK ---
+   // Close positions with trailing profit lock
    for (int i = PositionsTotal() - 1; i >= 0; i--) {
       ulong ticket = PositionGetTicket(i);
       if (!PositionSelectByTicket(ticket)) continue;
@@ -189,7 +227,7 @@ void OnTick() {
       
       if (lockIdx == -1 && profit >= MinProfitUSD) {
          AddLock(ticket, profit - TrailingLockStep);
-         Print("🔒 Trailing lock set at $", profit - TrailingLockStep, " for ticket ", ticket);
+         Print("🔒 Trailing lock set at $", profit - TrailingLockStep);
       }
       else if (lockIdx != -1) {
          if (profit > lockValues[lockIdx] + TrailingLockStep) {
@@ -200,37 +238,26 @@ void OnTick() {
             if (trade.PositionClose(ticket)) {
                Print("✅ [CLOSE] Ticket ", ticket, " profit: $", profit);
                if (profit < 0) consecutiveLosses++;
-               else {
-                  consecutiveLosses = 0;
-                  Print("🏆 Consecutive wins reset.");
-               }
-            } else Print("❌ [CLOSE FAIL] error ", GetLastError());
+               else consecutiveLosses = 0;
+            }
             RemoveLock(lockIdx);
          }
       }
    }
    
-   // --- STOP IF TOO MANY LOSSES ---
    if (consecutiveLosses >= MaxConsecutiveLosses) {
       static int warn = 0;
-      if (warn++ % 50 == 0) Print("⚠️ ", consecutiveLosses, " consecutive losses. EA paused.");
+      if (warn++ % 50 == 0) Print("⚠️ ", consecutiveLosses, " consecutive losses. Paused.");
       return;
    }
    
-   // --- POSITION LIMIT & COOLDOWN ---
    if (PositionsTotal() >= MaxOpenPositions) return;
    if (TimeCurrent() - last_trade_time < 5) return;
    
-   // --- FETCH ECB RATES (Lead Data) ---
    double ecb_chf, ecb_usd;
-   if (!FetchECBRates(ecb_chf, ecb_usd)) {
-      static int wait = 0;
-      if (wait++ % 100 == 0) Print("⏳ Waiting for ECB data...");
-      return;
-   }
+   if (!FetchECBRates(ecb_chf, ecb_usd)) return;
    
-   // --- GET MT5 BROKER PRICES (Lag Data) ---
-   string brokerSymbol = BaseCurrency + QuoteCurrency1;  // e.g., "EURCHF"
+   string brokerSymbol = BaseCurrency + QuoteCurrency1;
    double mt5_ask = SymbolInfoDouble(brokerSymbol, SYMBOL_ASK);
    double mt5_bid = SymbolInfoDouble(brokerSymbol, SYMBOL_BID);
    if (mt5_ask <= 0 || mt5_bid <= 0) {
@@ -239,65 +266,48 @@ void OnTick() {
    }
    double mt5_mid = (mt5_ask + mt5_bid) / 2.0;
    
-   // --- CALCULATE MISPRICING ---
-   // Mispricing = ECB rate (lead) - MT5 rate (lag) in points
    double point = SymbolInfoDouble(brokerSymbol, SYMBOL_POINT);
    double mispricing_points = (ecb_chf - mt5_mid) / point;
    
-   // --- ADDITIONAL VALIDATION: Check EUR/USD direction ---
-   // If EUR/USD is also showing directional divergence, confirms the mispricing
    double mt5_eurusd_mid = (SymbolInfoDouble("EURUSD", SYMBOL_ASK) + SymbolInfoDouble("EURUSD", SYMBOL_BID)) / 2.0;
-   double usdchf_synthetic = ecb_usd * mt5_eurusd_mid;  // Synthetic USD/CHF for validation
    bool eur_direction_aligns = (ecb_usd > mt5_eurusd_mid) == (mispricing_points > 0);
    
-   // --- GENERATE SIGNAL (only if validation confirms) ---
    bool buy_signal  = (mispricing_points > MinMispricingPoints) && eur_direction_aligns;
    bool sell_signal = (mispricing_points < -MinMispricingPoints) && eur_direction_aligns;
    
-   // --- DEBUG OUTPUT (every 10 seconds) ---
    if (TimeCurrent() - last_debug >= 10) {
       last_debug = TimeCurrent();
       Print("========================================");
       Print("🏦 ECB Lead: EUR/", QuoteCurrency1, " = ", DoubleToString(ecb_chf, 5));
       Print("📊 MT5 Lag:  EUR/", QuoteCurrency1, " = ", DoubleToString(mt5_mid, 5));
       Print("📉 Mispricing: ", DoubleToString(mispricing_points, 2), " points");
-      Print("📊 EUR/USD ECB: ", ecb_usd, " | MT5: ", mt5_eurusd_mid);
       Print("🔍 Signal: ", buy_signal ? "BUY" : (sell_signal ? "SELL" : "HOLD"));
-      Print("📊 Daily Loss: $", DoubleToString(dailyLoss, 2), " (", DoubleToString(lossPercent,1), "%)");
       Print("========================================");
    }
    
    if (!buy_signal && !sell_signal) return;
    
-   // --- POSITION SIZING (Dynamic compounding on wins) ---
    double baseLot = NormalizeDouble(equity / 1000.0 * (RiskPercent / 100.0), 2);
    baseLot = MathMax(0.01, baseLot);
-   double lot = baseLot * MathPow(1.3, MathMin(consecutiveLosses, 8));  // Compounding increases after losses
+   double lot = baseLot * MathPow(1.3, MathMin(consecutiveLosses, 8));
    lot = MathMin(lot, SymbolInfoDouble(brokerSymbol, SYMBOL_VOLUME_MAX));
    
-   // --- EXECUTE TRADE ---
    bool executed = false;
    if (buy_signal) {
-      executed = trade.Buy(lot, brokerSymbol, mt5_ask, 0, 0, "ECB Arbitrage Buy");
+      executed = trade.Buy(lot, brokerSymbol, mt5_ask, 0, 0, "ECB Arb Buy");
       if (executed) Print("🔥 [BUY] Mispricing: ", mispricing_points, " pts | Lot: ", lot);
-   }
-   else if (sell_signal) {
-      executed = trade.Sell(lot, brokerSymbol, mt5_bid, 0, 0, "ECB Arbitrage Sell");
+   } else if (sell_signal) {
+      executed = trade.Sell(lot, brokerSymbol, mt5_bid, 0, 0, "ECB Arb Sell");
       if (executed) Print("🔥 [SELL] Mispricing: ", mispricing_points, " pts | Lot: ", lot);
    }
    
-   if (executed) {
-      last_trade_time = TimeCurrent();
-   } else {
-      Print("❌ Order failed. Error: ", GetLastError());
-   }
+   if (executed) last_trade_time = TimeCurrent();
+   else Print("❌ Order failed. Error: ", GetLastError());
 }
 
 //+------------------------------------------------------------------+
-//| Expert deinitialization                                         |
-//+------------------------------------------------------------------+
 void OnDeinit(const int reason) {
-   Print("🏦 ECB Arbitrage EA stopped. Daily loss: $", dailyLoss);
+   Print("🏦 ECB Arbitrage EA stopped.");
 }
 EOF
 
