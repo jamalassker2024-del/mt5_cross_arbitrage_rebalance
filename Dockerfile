@@ -22,12 +22,12 @@ RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
 //|                                      ECB_Arbitrage_Aggressor.mq5 |
 //|                     Uses ECB official rates as lead data feed   |
-//|                     Fixed JSON parsing - no external libraries  |
+//|                     + London session filter (8-22)             |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
 #property copyright "Omni-Apex ECB Arbitrage"
-#property version   "4.20"
+#property version   "5.00"
 #property strict
 
 // --- INPUTS --------------------------------------------------------+
@@ -42,7 +42,8 @@ input double   MinProfitUSD           = 1.00;
 input double   TrailingLockStep       = 0.15;
 input int      MaxConsecutiveLosses   = 3;
 input double   MaxDailyLossPercent    = 8.0;
-input bool     DebugPrintResponse     = false;      // Set to true to see raw JSON in Experts tab
+input int      StartHour              = 8;          // London session start (server time)
+input int      EndHour                = 22;         // Session end – close all at this hour
 
 // --- GLOBALS -------------------------------------------------------+
 CTrade trade;
@@ -59,46 +60,38 @@ ulong   lockTickets[];
 double  lockValues[];
 
 //+------------------------------------------------------------------+
-//| Robust JSON value extractor - finds first number after a key    |
+//| Check if we are inside trading hours (server time)              |
 //+------------------------------------------------------------------+
-double ExtractJsonNumber(string json, string key) {
-   // Find the key (e.g., "0:0:0:0:0" or "0:0:0:0:1")
-   int keyPos = StringFind(json, key);
-   if (keyPos == -1) return -1;
-   
-   // Search for a colon after the key
-   int colonPos = StringFind(json, ":", keyPos);
-   if (colonPos == -1) return -1;
-   
-   // Look for the start of the numeric value (skip any quotes or braces)
-   int start = colonPos + 1;
-   while (start < StringLen(json) && (StringSubstr(json, start, 1) == "\"" || 
-          StringSubstr(json, start, 1) == " " || 
-          StringSubstr(json, start, 1) == "{" ||
-          StringSubstr(json, start, 1) == "[")) start++;
-   
-   // Now collect numeric characters (digits, decimal point, minus sign)
-   string numStr = "";
-   for (int i = start; i < StringLen(json); i++) {
-      string ch = StringSubstr(json, i, 1);
-      if ((ch >= "0" && ch <= "9") || ch == "." || ch == "-") {
-         numStr += ch;
-      } else {
-         break;
-      }
-   }
-   
-   if (numStr == "") return -1;
-   return StringToDouble(numStr);
+bool IsTradingTime() {
+   int hour = TimeHour(TimeCurrent());
+   return (hour >= StartHour && hour < EndHour);
 }
 
 //+------------------------------------------------------------------+
-//| Fetch ECB exchange rates                                         |
+//| Close all positions (at session end)                            |
+//+------------------------------------------------------------------+
+void CloseAllPositions() {
+   for(int i = PositionsTotal()-1; i >= 0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
+         trade.PositionClose(ticket);
+         Print("🕒 [SESSION END] Closed position ", ticket);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Fetch ECB exchange rates using a more reliable endpoint         |
+//| Returns true and fills ecb_chf_rate, ecb_usd_rate               |
 //+------------------------------------------------------------------+
 bool FetchECBRates(double &ecb_chf_rate, double &ecb_usd_rate) {
+   // Alternative endpoint that returns the latest available observation
+   // The previous URL sometimes returned only header. This one uses the generic series key.
+   string url = "https://data-api.ecb.europa.eu/service/data/EXR/D.CHF.EUR.SP00.A?format=jsondata&lastNObservations=1";
+   
    char post[], result[];
    string headers;
-   int res = WebRequest("GET", ecb_url, NULL, NULL, 10000, post, 0, result, headers);
+   int res = WebRequest("GET", url, NULL, NULL, 10000, post, 0, result, headers);
    if (res <= 0) {
       static int failCount = 0;
       if (failCount++ % 50 == 0) Print("❌ ECB WebRequest failed. Error: ", GetLastError());
@@ -107,48 +100,60 @@ bool FetchECBRates(double &ecb_chf_rate, double &ecb_usd_rate) {
    
    string response = CharArrayToString(result);
    
-   // Optional debug: print first 500 chars of response
-   if (DebugPrintResponse && TimeCurrent() % 30 == 0) {
-      Print("ECB Response (first 500 chars): ", StringSubstr(response, 0, 500));
-   }
-   
-   // The ECB response contains two series: CHF (0:0:0:0:0) and USD (0:0:0:0:1)
-   // We need to find the latest observation value for each.
-   // Different ECB endpoints may have slightly different keys. Try multiple patterns.
-   
-   ecb_chf_rate = ExtractJsonNumber(response, "\"0:0:0:0:0\"");
-   if (ecb_chf_rate <= 0) {
-      // Try alternative pattern (some endpoints use "0:0:0:0:0:0")
-      ecb_chf_rate = ExtractJsonNumber(response, "\"0:0:0:0:0:0\"");
-   }
-   
-   ecb_usd_rate = ExtractJsonNumber(response, "\"0:0:0:0:1\"");
-   if (ecb_usd_rate <= 0) {
-      ecb_usd_rate = ExtractJsonNumber(response, "\"0:0:0:0:1:0\"");
-   }
-   
-   // If still not found, try searching for "value" field (common in some ECB responses)
-   if (ecb_chf_rate <= 0) ecb_chf_rate = ExtractJsonNumber(response, "\"value\"");
-   if (ecb_usd_rate <= 0) ecb_usd_rate = ExtractJsonNumber(response, "\"value\"");
-   
-   if (ecb_chf_rate <= 0 || ecb_usd_rate <= 0) {
+   // Parse the CHF rate: look for "value" under observations
+   // The structure is: ... "observations":{"0":{"0":[value]}} ...
+   int obsPos = StringFind(response, "\"observations\"");
+   if (obsPos == -1) {
       static int parseFail = 0;
-      if (parseFail++ % 20 == 0) {
-         Print("❌ Failed to parse ECB response. Raw preview: ", StringSubstr(response, 0, 300));
-      }
+      if (parseFail++ % 20 == 0) Print("❌ No observations in ECB response. Raw: ", StringSubstr(response, 0, 300));
       return false;
    }
    
-   return true;
+   // Find the first numeric value after "0":
+   int valPos = StringFind(response, "\"0\":", obsPos);
+   if (valPos == -1) return false;
+   valPos = StringFind(response, "[", valPos);
+   if (valPos == -1) return false;
+   int start = valPos + 1;
+   while (start < StringLen(response) && (StringSubstr(response, start, 1) == " " || 
+          StringSubstr(response, start, 1) == "\"" || 
+          StringSubstr(response, start, 1) == "[")) start++;
+   int end = start;
+   while (end < StringLen(response) && (StringSubstr(response, end, 1) >= "0" && 
+          StringSubstr(response, end, 1) <= "9") || StringSubstr(response, end, 1) == ".") end++;
+   if (end <= start) return false;
+   string chfStr = StringSubstr(response, start, end - start);
+   ecb_chf_rate = StringToDouble(chfStr);
+   
+   // Now fetch USD rate similarly
+   url = "https://data-api.ecb.europa.eu/service/data/EXR/D.USD.EUR.SP00.A?format=jsondata&lastNObservations=1";
+   res = WebRequest("GET", url, NULL, NULL, 10000, post, 0, result, headers);
+   if (res <= 0) return false;
+   response = CharArrayToString(result);
+   obsPos = StringFind(response, "\"observations\"");
+   if (obsPos == -1) return false;
+   valPos = StringFind(response, "\"0\":", obsPos);
+   if (valPos == -1) return false;
+   valPos = StringFind(response, "[", valPos);
+   if (valPos == -1) return false;
+   start = valPos + 1;
+   while (start < StringLen(response) && (StringSubstr(response, start, 1) == " " || 
+          StringSubstr(response, start, 1) == "\"" || 
+          StringSubstr(response, start, 1) == "[")) start++;
+   end = start;
+   while (end < StringLen(response) && (StringSubstr(response, end, 1) >= "0" && 
+          StringSubstr(response, end, 1) <= "9") || StringSubstr(response, end, 1) == ".") end++;
+   if (end <= start) return false;
+   string usdStr = StringSubstr(response, start, end - start);
+   ecb_usd_rate = StringToDouble(usdStr);
+   
+   return (ecb_chf_rate > 0 && ecb_usd_rate > 0);
 }
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                           |
 //+------------------------------------------------------------------+
 int OnInit() {
-   // ECB API endpoint (last 1 observation for CHF and USD against EUR)
-   ecb_url = "https://data-api.ecb.europa.eu/service/data/EXR/D.CHF+USD.EUR.SP00.A?format=jsondata&lastNObservations=1";
-   
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
    SymbolSelect(_Symbol, true);
@@ -156,16 +161,16 @@ int OnInit() {
    dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
    
    Print("==============================================");
-   Print("🏦 ECB ARBITRAGE EA - FIXED PARSING");
+   Print("🏦 ECB ARBITRAGE EA - SESSION FILTER v5.0");
    Print("   Pair: ", BaseCurrency, "/", QuoteCurrency1);
-   Print("   API: ", ecb_url);
+   Print("   Trading hours: ", StartHour, ":00 - ", EndHour, ":00 (server time)");
    Print("   MinMispricing: ", MinMispricingPoints, " pts | MinProfit: $", MinProfitUSD);
    Print("==============================================");
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
-//| Trailing lock helpers (same as before)                          |
+//| Trailing lock helpers                                            |
 //+------------------------------------------------------------------+
 int FindLockIndex(ulong ticket) {
    for (int i = 0; i < ArraySize(lockTickets); i++)
@@ -195,7 +200,13 @@ void AddLock(ulong ticket, double lockValue) {
 //| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick() {
-   // Daily reset and loss limit (same as before)
+   // --- SESSION FILTER: close all at EndHour, no trading outside hours
+   if(!IsTradingTime()) {
+      CloseAllPositions();
+      return;
+   }
+   
+   // Daily reset and loss limit
    if (TimeCurrent() - dayStart >= 86400) {
       dayStart = TimeCurrent();
       dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -257,7 +268,7 @@ void OnTick() {
    double ecb_chf, ecb_usd;
    if (!FetchECBRates(ecb_chf, ecb_usd)) return;
    
-   string brokerSymbol = BaseCurrency + QuoteCurrency1;
+   string brokerSymbol = BaseCurrency + QuoteCurrency1; // e.g., "EURCHF"
    double mt5_ask = SymbolInfoDouble(brokerSymbol, SYMBOL_ASK);
    double mt5_bid = SymbolInfoDouble(brokerSymbol, SYMBOL_BID);
    if (mt5_ask <= 0 || mt5_bid <= 0) {
