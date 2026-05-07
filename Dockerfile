@@ -20,39 +20,48 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                      VALETAX_TICK_BOT_V16.mq5    |
-//|                     Fixed: manual broker symbol input           |
+//|                                 Pairs_Trading_StatArb_EA.mq5     |
+//|                     For Valetax .vx symbols, fast profit exit   |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
+// No external libraries needed
 
-#property copyright "Fixed Arbitrage EA"
-#property version   "9.00"
+#property copyright "Omni-Apex Statistical Arbitrage"
+#property version   "2.1"
 #property strict
 
-// --- INPUTS (set your broker's symbol for EUR/CHF)
-input string   BrokerSymbol         = "EURCHF";     // ← CHANGE THIS to your broker's symbol (e.g., "EUR/CHF", "EURCHFm")
-input double   RiskPercent          = 3.0;
-input int      MinMispricingPoints  = 1;            // Any difference >=1 point triggers trade
-input int      MaxOpenPositions     = 3;
-input int      MagicNumber          = 999888;
-input double   MinProfitUSD         = 0.50;
-input double   TrailingLockStep     = 0.10;
-input int      MaxConsecutiveLosses = 5;
-input double   MaxDailyLossPercent  = 15.0;
-input int      StartHour            = 0;            // 24/7 for testing
-input int      EndHour              = 24;
+// --- INPUTS (CHANGE THESE TO YOUR BROKER'S SYMBOLS) ---------------+
+input string   AssetA           = "EURUSD.vx";     // e.g., EURUSD.vx
+input string   AssetB           = "GBPUSD.vx";     // e.g., GBPUSD.vx
+input double   RiskPercent      = 2.0;             // % equity per trade (total of both legs)
+input int      LookbackPeriod   = 50;              // Period for spread mean/std dev (bars)
+input double   EntryZScore      = 2.0;             // Entry threshold (absolute Z‑Score)
+input double   ExitZScore       = 0.5;             // Exit threshold (Z‑Score)
+input double   MinProfitUSD     = 1.00;            // Minimum total profit to close (optional)
+input int      MaxOpenPositions = 1;               // Max concurrent pair positions
+input int      MagicNumber      = 777888;
+input int      StartHour        = 0;               // For testing, set to 0-24; change to 8-22 later
+input int      EndHour          = 24;
+input double   MaxDailyLossPercent = 8.0;
+input bool     DebugPrint       = true;            // Show spread and Z‑Score every 5 sec
 
-// --- GLOBALS
-CTrade trade;
-datetime last_debug = 0;
-datetime last_trade_time = 0;
+// --- GLOBALS -------------------------------------------------------+
+CTrade tradeA, tradeB;
+double spreadBuffer[];
+datetime lastDebug = 0;
+datetime lastTrade = 0;
 datetime dayStart = 0;
 double dailyEquityStart = 0;
-bool tradingEnabled = true;
 int consecutiveLosses = 0;
-ulong   lockTickets[];
-double  lockValues[];
-string usedSymbol = "";
+bool tradingEnabled = true;
+
+struct PairTrade {
+   ulong ticketA;
+   ulong ticketB;
+   double profitLock;
+   bool closed;
+};
+PairTrade activeTrades[];
 
 //+------------------------------------------------------------------+
 //| Check trading hours                                             |
@@ -64,118 +73,100 @@ bool IsTradingTime() {
 }
 
 //+------------------------------------------------------------------+
-//| Close all positions                                             |
+//| Calculate mean of array                                         |
 //+------------------------------------------------------------------+
-void CloseAllPositions() {
-   for(int i = PositionsTotal()-1; i >= 0; i--) {
-      ulong ticket = PositionGetTicket(i);
-      if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
-         trade.PositionClose(ticket);
-         Print("🕒 Closed ", ticket);
-      }
+double CalcMean(double &arr[], int length) {
+   double sum = 0.0;
+   for(int i=0; i<length; i++) sum += arr[i];
+   return sum/length;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate standard deviation                                     |
+//+------------------------------------------------------------------+
+double CalcStdDev(double &arr[], double mean, int length) {
+   double sum = 0.0;
+   for(int i=0; i<length; i++) sum += MathPow(arr[i] - mean, 2);
+   return MathSqrt(sum/length);
+}
+
+//+------------------------------------------------------------------+
+//| Update spread buffer and get Z-Score                            |
+//+------------------------------------------------------------------+
+double GetZScore() {
+   double bidA = SymbolInfoDouble(AssetA, SYMBOL_BID);
+   double bidB = SymbolInfoDouble(AssetB, SYMBOL_BID);
+   if(bidA <= 0 || bidB <= 0) {
+      if(DebugPrint && TimeCurrent()-lastDebug>=5)
+         Print("❌ No price for ", AssetA, " or ", AssetB);
+      return 0;
    }
-}
-
-//+------------------------------------------------------------------+
-//| Fetch live EUR/CHF and EUR/USD (free API, no key)               |
-//+------------------------------------------------------------------+
-bool FetchRates(double &eur_chf, double &eur_usd) {
-   string url = "https://api.exchangerate-api.com/v4/latest/EUR";
-   char post[], result[];
-   string headers;
-   int res = WebRequest("GET", url, NULL, NULL, 5000, post, 0, result, headers);
-   if(res <= 0) {
-      static int fail=0;
-      if(fail++%20==0) Print("❌ API failed, error: ", GetLastError());
-      return false;
+   double spread = bidA - bidB;
+   
+   // Shift buffer
+   int sz = ArraySize(spreadBuffer);
+   if(sz < LookbackPeriod) {
+      ArrayResize(spreadBuffer, LookbackPeriod);
+      for(int i=sz; i<LookbackPeriod; i++) spreadBuffer[i] = spread;
    }
-   string response = CharArrayToString(result);
+   for(int i=LookbackPeriod-1; i>0; i--)
+      spreadBuffer[i] = spreadBuffer[i-1];
+   spreadBuffer[0] = spread;
    
-   // Parse {"rates":{"CHF":0.9876,"USD":1.0891}}
-   int chfPos = StringFind(response, "\"CHF\":");
-   if(chfPos<0) return false;
-   int chfStart = chfPos + 6;
-   int chfEnd = StringFind(response, ",", chfStart);
-   if(chfEnd<0) chfEnd = StringFind(response, "}", chfStart);
-   eur_chf = StringToDouble(StringSubstr(response, chfStart, chfEnd-chfStart));
-   
-   int usdPos = StringFind(response, "\"USD\":");
-   if(usdPos<0) return false;
-   int usdStart = usdPos + 6;
-   int usdEnd = StringFind(response, ",", usdStart);
-   if(usdEnd<0) usdEnd = StringFind(response, "}", usdStart);
-   eur_usd = StringToDouble(StringSubstr(response, usdStart, usdEnd-usdStart));
-   
-   return (eur_chf>0 && eur_usd>0);
+   double mean = CalcMean(spreadBuffer, LookbackPeriod);
+   double stdDev = CalcStdDev(spreadBuffer, mean, LookbackPeriod);
+   if(stdDev == 0) return 0;
+   return (spread - mean) / stdDev;
 }
 
 //+------------------------------------------------------------------+
-//| Trailing lock helpers                                           |
+//| Close a pair trade                                               |
 //+------------------------------------------------------------------+
-int FindLockIndex(ulong ticket) {
-   for(int i=0;i<ArraySize(lockTickets);i++) if(lockTickets[i]==ticket) return i;
-   return -1;
-}
-void RemoveLock(int idx) {
-   int sz=ArraySize(lockTickets);
-   for(int i=idx;i<sz-1;i++) { lockTickets[i]=lockTickets[i+1]; lockValues[i]=lockValues[i+1]; }
-   ArrayResize(lockTickets, sz-1);
-   ArrayResize(lockValues, sz-1);
-}
-void AddLock(ulong ticket, double lockValue) {
-   int sz=ArraySize(lockTickets);
-   ArrayResize(lockTickets, sz+1);
-   ArrayResize(lockValues, sz+1);
-   lockTickets[sz]=ticket;
-   lockValues[sz]=lockValue;
+void ClosePairTrade(int idx) {
+   if(activeTrades[idx].ticketA > 0) tradeA.PositionClose(activeTrades[idx].ticketA);
+   if(activeTrades[idx].ticketB > 0) tradeB.PositionClose(activeTrades[idx].ticketB);
+   activeTrades[idx].closed = true;
 }
 
 //+------------------------------------------------------------------+
-//| Expert initialization                                           |
+//| Initialize                                                      |
 //+------------------------------------------------------------------+
 int OnInit() {
-   trade.SetExpertMagicNumber(MagicNumber);
-   trade.SetTypeFilling(ORDER_FILLING_IOC);
-   
-   // Check if the broker symbol exists
-   usedSymbol = BrokerSymbol;
-   double test = SymbolInfoDouble(usedSymbol, SYMBOL_BID);
-   if(test <= 0) {
-      Print("❌ Broker symbol '", usedSymbol, "' not found! Trying chart symbol...");
-      usedSymbol = _Symbol;
-      test = SymbolInfoDouble(usedSymbol, SYMBOL_BID);
-      if(test <= 0) {
-         Print("❌ Chart symbol '", usedSymbol, "' also invalid. Please set correct BrokerSymbol input.");
-         return INIT_FAILED;
-      } else {
-         Print("✅ Using chart symbol: ", usedSymbol);
-      }
-   } else {
-      Print("✅ Using broker symbol: ", usedSymbol);
-   }
-   SymbolSelect(usedSymbol, true);
-   
+   tradeA.SetExpertMagicNumber(MagicNumber);
+   tradeB.SetExpertMagicNumber(MagicNumber+1);
+   // Ensure symbols are visible
+   SymbolSelect(AssetA, true);
+   SymbolSelect(AssetB, true);
+   ArrayResize(spreadBuffer, 0);
+   ArrayResize(activeTrades, 0);
    dayStart = TimeCurrent();
    dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
    Print("==============================================");
-   Print("🚀 FREE ARBITRAGE EA (fixed symbol)");
-   Print("   Trading: ", usedSymbol);
-   Print("   Min mispricing: ", MinMispricingPoints, " points");
+   Print("📊 Statistical Arbitrage EA (Pairs Trading)");
+   Print("   Pair: ", AssetA, " vs ", AssetB);
+   Print("   Entry Z‑Score: ±", EntryZScore, " | Exit Z‑Score: ±", ExitZScore);
+   Print("   Trading hours: ", StartHour, ":00 - ", EndHour, ":00");
    Print("==============================================");
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
-//| Expert tick                                                     |
+//| Tick handler                                                    |
 //+------------------------------------------------------------------+
 void OnTick() {
-   if(!IsTradingTime()) { CloseAllPositions(); return; }
+   // Session filter
+   if(!IsTradingTime()) {
+      for(int i=0; i<ArraySize(activeTrades); i++) if(!activeTrades[i].closed) ClosePairTrade(i);
+      return;
+   }
    
+   // Daily loss & reset
    datetime now = TimeCurrent();
    if(now - dayStart >= 86400) {
       dayStart = now;
       dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
       tradingEnabled = true;
+      consecutiveLosses = 0;
       Print("✅ New trading day");
    }
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -188,73 +179,111 @@ void OnTick() {
    if(!tradingEnabled && lossPercent < MaxDailyLossPercent-2) tradingEnabled = true;
    if(!tradingEnabled) return;
    
-   // Close profitable positions with trailing lock
-   for(int i=PositionsTotal()-1; i>=0; i--) {
-      ulong ticket = PositionGetTicket(i);
-      if(!PositionSelectByTicket(ticket)) continue;
-      if(PositionGetInteger(POSITION_MAGIC)!=MagicNumber) continue;
-      double profit = PositionGetDouble(POSITION_PROFIT);
-      int lockIdx = FindLockIndex(ticket);
-      if(lockIdx==-1 && profit>=MinProfitUSD) {
-         AddLock(ticket, profit - TrailingLockStep);
-         Print("🔒 Lock set at $", profit - TrailingLockStep);
-      } else if(lockIdx!=-1) {
-         if(profit > lockValues[lockIdx]+TrailingLockStep) {
-            lockValues[lockIdx] = profit - TrailingLockStep;
-            Print("🔓 Trail lock raised to $", lockValues[lockIdx]);
+   // Close profitable pair trades (fast out + trailing lock)
+   for(int i=0; i<ArraySize(activeTrades); i++) {
+      if(activeTrades[i].closed) continue;
+      double profit = 0;
+      if(PositionSelectByTicket(activeTrades[i].ticketA)) profit += PositionGetDouble(POSITION_PROFIT);
+      if(PositionSelectByTicket(activeTrades[i].ticketB)) profit += PositionGetDouble(POSITION_PROFIT);
+      
+      if(activeTrades[i].profitLock == 0 && profit >= MinProfitUSD) {
+         activeTrades[i].profitLock = profit - 0.10;
+         Print("🔒 Lock set at $", activeTrades[i].profitLock);
+      }
+      else if(activeTrades[i].profitLock > 0) {
+         if(profit > activeTrades[i].profitLock + 0.10) {
+            activeTrades[i].profitLock = profit - 0.10;
+            Print("🔓 Trail lock raised to $", activeTrades[i].profitLock);
          }
-         if(profit <= lockValues[lockIdx]) {
-            if(trade.PositionClose(ticket)) {
-               Print("✅ Closed $", profit);
-               if(profit<0) consecutiveLosses++; else consecutiveLosses=0;
-            }
-            RemoveLock(lockIdx);
+         if(profit <= activeTrades[i].profitLock) {
+            ClosePairTrade(i);
+            Print("✅ Pair trade closed with profit: $", profit);
+            if(profit < 0) consecutiveLosses++;
+            else consecutiveLosses = 0;
          }
       }
+      else if(profit > MinProfitUSD && activeTrades[i].profitLock == 0) {
+         ClosePairTrade(i);
+         Print("✅ Pair trade closed (no lock) profit: $", profit);
+         consecutiveLosses = 0;
+      }
    }
-   if(consecutiveLosses >= MaxConsecutiveLosses) { static int w=0; if(w++%50==0) Print("⛔ Paused"); return; }
-   if(PositionsTotal() >= MaxOpenPositions) return;
-   if(now - last_trade_time < 3) return;
    
-   double lead_chf, lead_usd;
-   if(!FetchRates(lead_chf, lead_usd)) return;
+   // Remove closed trades
+   for(int i=ArraySize(activeTrades)-1; i>=0; i--) {
+      if(activeTrades[i].closed) {
+         for(int j=i; j<ArraySize(activeTrades)-1; j++) activeTrades[j] = activeTrades[j+1];
+         ArrayResize(activeTrades, ArraySize(activeTrades)-1);
+      }
+   }
    
-   double mt5_ask = SymbolInfoDouble(usedSymbol, SYMBOL_ASK);
-   double mt5_bid = SymbolInfoDouble(usedSymbol, SYMBOL_BID);
-   if(mt5_ask <= 0 || mt5_bid <= 0) {
-      Print("❌ No price for ", usedSymbol, " – check symbol name");
+   // Limits
+   if(ArraySize(activeTrades) >= MaxOpenPositions) return;
+   if(consecutiveLosses >= 3) {
+      static int warn=0; if(warn++%50==0) Print("⛔ Paused due to losses");
       return;
    }
-   double mt5_mid = (mt5_ask + mt5_bid) / 2.0;
-   double point = SymbolInfoDouble(usedSymbol, SYMBOL_POINT);
-   double mispricing = (lead_chf - mt5_mid) / point;
+   if(now - lastTrade < 10) return;
    
-   if(now - last_debug >= 5) {
-      last_debug = now;
+   // Calculate Z‑Score
+   double zScore = GetZScore();
+   if(zScore == 0 || ArraySize(spreadBuffer) < LookbackPeriod) return;
+   
+   // Debug
+   if(DebugPrint && now - lastDebug >= 5) {
+      lastDebug = now;
+      double bidA = SymbolInfoDouble(AssetA, SYMBOL_BID);
+      double bidB = SymbolInfoDouble(AssetB, SYMBOL_BID);
+      double spread = bidA - bidB;
       Print("========================================");
-      Print("📊 Lead EUR/CHF: ", lead_chf, " | MT5: ", mt5_mid);
-      Print("📉 Mispricing: ", DoubleToString(mispricing,2), " points");
-      Print("📈 Positions: ", PositionsTotal());
+      Print("📊 Spread: ", DoubleToString(spread,5), " | Z‑Score: ", DoubleToString(zScore,2));
+      Print("   Active pairs: ", ArraySize(activeTrades));
       Print("========================================");
    }
    
-   bool buy_signal = (mispricing > MinMispricingPoints);
-   bool sell_signal = (mispricing < -MinMispricingPoints);
-   if(!buy_signal && !sell_signal) return;
+   // Signals
+   bool buyPair = (zScore > EntryZScore);   // short A, long B
+   bool sellPair = (zScore < -EntryZScore); // long A, short B
+   if(!buyPair && !sellPair) return;
    
-   double lot = NormalizeDouble(equity/1000.0 * (RiskPercent/100.0), 2);
+   // Position sizing
+   double lot = NormalizeDouble(equity / 1000.0 * (RiskPercent / 100.0), 2);
    lot = MathMax(0.01, lot);
+   lot = MathMin(lot, SymbolInfoDouble(AssetA, SYMBOL_VOLUME_MAX));
    
-   if(buy_signal) {
-      if(trade.Buy(lot, usedSymbol, mt5_ask, 0, 0, "Arb Buy"))
-         Print("🔥 BUY at ", mt5_ask, " diff: ", mispricing);
-      else Print("❌ Buy failed: ", GetLastError());
-   } else if(sell_signal) {
-      if(trade.Sell(lot, usedSymbol, mt5_bid, 0, 0, "Arb Sell"))
-         Print("🔥 SELL at ", mt5_bid, " diff: ", mispricing);
-      else Print("❌ Sell failed: ", GetLastError());
+   PairTrade newTrade;
+   newTrade.closed = false;
+   newTrade.profitLock = 0;
+   
+   if(buyPair) {
+      newTrade.ticketA = tradeA.Sell(lot, AssetA, SymbolInfoDouble(AssetA, SYMBOL_BID), 0, 0, "Short A");
+      newTrade.ticketB = tradeB.Buy(lot, AssetB, SymbolInfoDouble(AssetB, SYMBOL_ASK), 0, 0, "Long B");
+      if(newTrade.ticketA && newTrade.ticketB)
+         Print("🔥 OPENED: Short ", AssetA, " + Long ", AssetB, " | Z=", zScore);
+      else {
+         if(newTrade.ticketA) tradeA.PositionClose(newTrade.ticketA);
+         if(newTrade.ticketB) tradeB.PositionClose(newTrade.ticketB);
+         Print("❌ Failed to open pair");
+         return;
+      }
    }
-   last_trade_time = now;
+   else if(sellPair) {
+      newTrade.ticketA = tradeA.Buy(lot, AssetA, SymbolInfoDouble(AssetA, SYMBOL_ASK), 0, 0, "Long A");
+      newTrade.ticketB = tradeB.Sell(lot, AssetB, SymbolInfoDouble(AssetB, SYMBOL_BID), 0, 0, "Short B");
+      if(newTrade.ticketA && newTrade.ticketB)
+         Print("🔥 OPENED: Long ", AssetA, " + Short ", AssetB, " | Z=", zScore);
+      else {
+         if(newTrade.ticketA) tradeA.PositionClose(newTrade.ticketA);
+         if(newTrade.ticketB) tradeB.PositionClose(newTrade.ticketB);
+         Print("❌ Failed to open pair");
+         return;
+      }
+   }
+   
+   int sz = ArraySize(activeTrades);
+   ArrayResize(activeTrades, sz+1);
+   activeTrades[sz] = newTrade;
+   lastTrade = now;
 }
 //+------------------------------------------------------------------+
 EOF
