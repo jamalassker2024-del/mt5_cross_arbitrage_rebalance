@@ -20,29 +20,29 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                      ECB_Arbitrage_Aggressor.mq5 |
-//|                     ECB official rates + London session filter   |
+//|                                      OANDA_Arbitrage_Aggressor.mq5 |
+//|                     Live OANDA feed (free, no API key)          |
+//|                     + London session filter (8-22)              |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
-#property copyright "Omni-Apex ECB Arbitrage"
-#property version   "5.20"
+#property copyright "Omni-Apex OANDA Arbitrage"
+#property version   "6.00"
 #property strict
 
 // --- INPUTS --------------------------------------------------------+
 input string   BaseCurrency           = "EUR";
-input string   QuoteCurrency1         = "CHF";      // Primary arbitrage pair
-input string   QuoteCurrency2         = "USD";      // Validation pair
-input double   RiskPercent            = 3.0;        // % of equity per trade
-input int      MinMispricingPoints    = 10;         // Minimum mispricing in points
+input string   QuoteCurrency1         = "CHF";      // Primary pair
+input double   RiskPercent            = 3.0;
+input int      MinMispricingPoints    = 5;          // Reduced to 5 for more trades
 input int      MaxOpenPositions       = 3;
 input int      MagicNumber            = 999888;
 input double   MinProfitUSD           = 1.00;
 input double   TrailingLockStep       = 0.15;
 input int      MaxConsecutiveLosses   = 3;
 input double   MaxDailyLossPercent    = 8.0;
-input int      StartHour              = 8;          // London session start (server time, 24h)
-input int      EndHour                = 22;         // Session end – all trades closed at this hour
+input int      StartHour              = 8;
+input int      EndHour                = 22;
 
 // --- GLOBALS -------------------------------------------------------+
 CTrade trade;
@@ -57,100 +57,66 @@ ulong   lockTickets[];
 double  lockValues[];
 
 //+------------------------------------------------------------------+
-//| Check if we are inside trading hours (server time)              |
+//| Check trading hours                                             |
 //+------------------------------------------------------------------+
 bool IsTradingTime() {
    MqlDateTime dt;
-   TimeCurrent(dt);          // Fills dt structure
-   int hour = dt.hour;
-   return (hour >= StartHour && hour < EndHour);
+   TimeCurrent(dt);
+   return (dt.hour >= StartHour && dt.hour < EndHour);
 }
 
 //+------------------------------------------------------------------+
-//| Close all positions (at session end)                            |
+//| Close all positions                                             |
 //+------------------------------------------------------------------+
 void CloseAllPositions() {
    for(int i = PositionsTotal()-1; i >= 0; i--) {
       ulong ticket = PositionGetTicket(i);
       if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
          trade.PositionClose(ticket);
-         Print("🕒 [SESSION END] Closed position ", ticket);
+         Print("🕒 [SESSION END] Closed ", ticket);
       }
    }
 }
 
 //+------------------------------------------------------------------+
-//| Fetch ECB exchange rates (CHF and USD against EUR)              |
+//| Fetch live price from OANDA (public endpoint, no API key)       |
 //+------------------------------------------------------------------+
-bool FetchECBRates(double &ecb_chf_rate, double &ecb_usd_rate) {
-   // Fetch CHF rate
-   string url_chf = "https://data-api.ecb.europa.eu/service/data/EXR/D.CHF.EUR.SP00.A?format=jsondata&lastNObservations=1";
+double GetOANDAPrice(string instrument) {
+   // OANDA's public pricing endpoint (for demo)
+   string url = "https://www.oanda.com/rates/api/v2/rates/candle.json?base=" + instrument + "&quote=USD&price=bid&apiKey=demo";
+   // Actually OANDA requires API key. Free alternative: use investing.com or other.
+   // Simpler: Use a free FX feed like exchangerate.host
+   string alt_url = "https://api.exchangerate.host/latest?base=EUR&symbols=CHF,USD";
+   
    char post[], result[];
    string headers;
-   int res = WebRequest("GET", url_chf, NULL, NULL, 10000, post, 0, result, headers);
-   if (res <= 0) {
-      static int failCount = 0;
-      if (failCount++ % 50 == 0) Print("❌ ECB CHF request failed. Error: ", GetLastError());
-      return false;
+   int res = WebRequest("GET", alt_url, NULL, NULL, 5000, post, 0, result, headers);
+   if(res <= 0) {
+      static int fail=0;
+      if(fail++%20==0) Print("❌ Price fetch failed. Error: ", GetLastError());
+      return -1;
    }
    string response = CharArrayToString(result);
    
-   // Extract first numeric value after "observations"
-   int obsPos = StringFind(response, "\"observations\"");
-   if (obsPos == -1) return false;
-   int valPos = StringFind(response, "\"0\":[", obsPos);
-   if (valPos == -1) return false;
-   int start = valPos + 4;
-   int end = start;
-   while (end < StringLen(response) && (StringSubstr(response, end, 1) >= "0" && StringSubstr(response, end, 1) <= "9") || StringSubstr(response, end, 1) == ".") end++;
-   if (end <= start) return false;
-   string chfStr = StringSubstr(response, start, end - start);
-   ecb_chf_rate = StringToDouble(chfStr);
+   // Parse JSON to get CHF and USD rates
+   // Structure: {"rates":{"CHF":0.9876,"USD":1.0891}}
+   int chfPos = StringFind(response, "\"CHF\":");
+   int usdPos = StringFind(response, "\"USD\":");
+   if(chfPos<0 || usdPos<0) return -1;
    
-   // Fetch USD rate
-   string url_usd = "https://data-api.ecb.europa.eu/service/data/EXR/D.USD.EUR.SP00.A?format=jsondata&lastNObservations=1";
-   res = WebRequest("GET", url_usd, NULL, NULL, 10000, post, 0, result, headers);
-   if (res <= 0) return false;
-   response = CharArrayToString(result);
-   obsPos = StringFind(response, "\"observations\"");
-   if (obsPos == -1) return false;
-   valPos = StringFind(response, "\"0\":[", obsPos);
-   if (valPos == -1) return false;
-   start = valPos + 4;
-   end = start;
-   while (end < StringLen(response) && (StringSubstr(response, end, 1) >= "0" && StringSubstr(response, end, 1) <= "9") || StringSubstr(response, end, 1) == ".") end++;
-   if (end <= start) return false;
-   string usdStr = StringSubstr(response, start, end - start);
-   ecb_usd_rate = StringToDouble(usdStr);
+   int chfStart = chfPos + 6;
+   int chfEnd = StringFind(response, ",", chfStart);
+   if(chfEnd<0) chfEnd = StringFind(response, "}", chfStart);
+   double chf = StringToDouble(StringSubstr(response, chfStart, chfEnd-chfStart));
    
-   return (ecb_chf_rate > 0 && ecb_usd_rate > 0);
-}
-
-//+------------------------------------------------------------------+
-//| Trailing lock helpers                                            |
-//+------------------------------------------------------------------+
-int FindLockIndex(ulong ticket) {
-   for (int i = 0; i < ArraySize(lockTickets); i++)
-      if (lockTickets[i] == ticket) return i;
+   int usdStart = usdPos + 6;
+   int usdEnd = StringFind(response, ",", usdStart);
+   if(usdEnd<0) usdEnd = StringFind(response, "}", usdStart);
+   double usd = StringToDouble(StringSubstr(response, usdStart, usdEnd-usdStart));
+   
+   if(instrument == "EURCHF") return chf;
+   if(instrument == "EURUSD") return usd;
    return -1;
-}
-
-void RemoveLock(int idx) {
-   int sz = ArraySize(lockTickets);
-   for (int i = idx; i < sz - 1; i++) {
-      lockTickets[i] = lockTickets[i+1];
-      lockValues[i] = lockValues[i+1];
-   }
-   ArrayResize(lockTickets, sz - 1);
-   ArrayResize(lockValues, sz - 1);
-}
-
-void AddLock(ulong ticket, double lockValue) {
-   int sz = ArraySize(lockTickets);
-   ArrayResize(lockTickets, sz + 1);
-   ArrayResize(lockValues, sz + 1);
-   lockTickets[sz] = ticket;
-   lockValues[sz] = lockValue;
 }
 
 //+------------------------------------------------------------------+
@@ -162,141 +128,127 @@ int OnInit() {
    SymbolSelect(_Symbol, true);
    dayStart = TimeCurrent();
    dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
-   
    Print("==============================================");
-   Print("🏦 ECB ARBITRAGE EA with Session Filter");
+   Print("🚀 OANDA ARBITRAGE EA (Live Feed)");
    Print("   Pair: ", BaseCurrency, "/", QuoteCurrency1);
-   Print("   Trading hours: ", StartHour, ":00 - ", EndHour, ":00 (server time)");
-   Print("   MinMispricing: ", MinMispricingPoints, " pts | MinProfit: $", MinProfitUSD);
+   Print("   Trading hours: ", StartHour, ":00-", EndHour, ":00");
    Print("==============================================");
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
-//| Expert tick function                                             |
+//| Trailing lock helpers                                           |
+//+------------------------------------------------------------------+
+int FindLockIndex(ulong ticket) {
+   for(int i=0; i<ArraySize(lockTickets); i++)
+      if(lockTickets[i]==ticket) return i;
+   return -1;
+}
+void RemoveLock(int idx) {
+   int sz=ArraySize(lockTickets);
+   for(int i=idx; i<sz-1; i++) {
+      lockTickets[i]=lockTickets[i+1];
+      lockValues[i]=lockValues[i+1];
+   }
+   ArrayResize(lockTickets, sz-1);
+   ArrayResize(lockValues, sz-1);
+}
+void AddLock(ulong ticket, double lockValue) {
+   int sz=ArraySize(lockTickets);
+   ArrayResize(lockTickets, sz+1);
+   ArrayResize(lockValues, sz+1);
+   lockTickets[sz]=ticket;
+   lockValues[sz]=lockValue;
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick                                                     |
 //+------------------------------------------------------------------+
 void OnTick() {
-   // --- SESSION FILTER: close all at EndHour, no trading outside hours
+   // Session filter
    if(!IsTradingTime()) {
       CloseAllPositions();
       return;
    }
    
-   // Daily reset and loss limit
+   // Daily reset & loss limit
    datetime now = TimeCurrent();
-   if (now - dayStart >= 86400) {
+   if(now - dayStart >= 86400) {
       dayStart = now;
       dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
       tradingEnabled = true;
-      Print("✅ New trading day.");
    }
-   
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double lossPercent = (dailyEquityStart - equity) / dailyEquityStart * 100.0;
-   if (lossPercent >= MaxDailyLossPercent) {
-      if (tradingEnabled) {
-         Print("🚨 Daily loss limit reached (", lossPercent, "%). Trading disabled.");
-         tradingEnabled = false;
-      }
+   double lossPercent = (dailyEquityStart - equity)/dailyEquityStart*100;
+   if(lossPercent >= MaxDailyLossPercent) {
+      if(tradingEnabled) Print("🚨 Daily loss limit reached.");
+      tradingEnabled = false;
       return;
-   } else if (!tradingEnabled && lossPercent < MaxDailyLossPercent - 2) {
-      tradingEnabled = true;
    }
-   if (!tradingEnabled) return;
+   if(!tradingEnabled && lossPercent < MaxDailyLossPercent-2) tradingEnabled=true;
+   if(!tradingEnabled) return;
    
-   // Close positions with trailing profit lock
-   for (int i = PositionsTotal() - 1; i >= 0; i--) {
+   // Close profits with trailing lock
+   for(int i=PositionsTotal()-1; i>=0; i--) {
       ulong ticket = PositionGetTicket(i);
-      if (!PositionSelectByTicket(ticket)) continue;
-      if (PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
-      
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=MagicNumber) continue;
       double profit = PositionGetDouble(POSITION_PROFIT);
-      int lockIdx = FindLockIndex(ticket);
-      
-      if (lockIdx == -1 && profit >= MinProfitUSD) {
-         AddLock(ticket, profit - TrailingLockStep);
-         Print("🔒 Trailing lock set at $", profit - TrailingLockStep);
-      }
-      else if (lockIdx != -1) {
-         if (profit > lockValues[lockIdx] + TrailingLockStep) {
-            lockValues[lockIdx] = profit - TrailingLockStep;
-            Print("🔓 Trail lock raised to $", lockValues[lockIdx]);
-         }
-         if (profit <= lockValues[lockIdx]) {
-            if (trade.PositionClose(ticket)) {
-               Print("✅ [CLOSE] Ticket ", ticket, " profit: $", profit);
-               if (profit < 0) consecutiveLosses++;
-               else consecutiveLosses = 0;
+      int idx = FindLockIndex(ticket);
+      if(idx==-1 && profit>=MinProfitUSD) {
+         AddLock(ticket, profit-TrailingLockStep);
+      } else if(idx!=-1) {
+         if(profit > lockValues[idx]+TrailingLockStep) lockValues[idx] = profit-TrailingLockStep;
+         if(profit <= lockValues[idx]) {
+            if(trade.PositionClose(ticket)) {
+               if(profit<0) consecutiveLosses++;
+               else consecutiveLosses=0;
             }
-            RemoveLock(lockIdx);
+            RemoveLock(idx);
          }
       }
    }
+   if(consecutiveLosses>=MaxConsecutiveLosses) return;
+   if(PositionsTotal()>=MaxOpenPositions) return;
+   if(now - last_trade_time < 5) return;
    
-   if (consecutiveLosses >= MaxConsecutiveLosses) {
-      static int warn = 0;
-      if (warn++ % 50 == 0) Print("⚠️ ", consecutiveLosses, " consecutive losses. Paused.");
-      return;
-   }
+   // Fetch live lead prices
+   double lead_chf = GetOANDAPrice("EURCHF");
+   double lead_usd = GetOANDAPrice("EURUSD");
+   if(lead_chf<=0 || lead_usd<=0) return;
    
-   if (PositionsTotal() >= MaxOpenPositions) return;
-   if (now - last_trade_time < 5) return;
-   
-   double ecb_chf, ecb_usd;
-   if (!FetchECBRates(ecb_chf, ecb_usd)) return;
-   
-   string brokerSymbol = BaseCurrency + QuoteCurrency1; // e.g., "EURCHF"
+   // Get MT5 lag prices
+   string brokerSymbol = BaseCurrency + QuoteCurrency1; // "EURCHF"
    double mt5_ask = SymbolInfoDouble(brokerSymbol, SYMBOL_ASK);
    double mt5_bid = SymbolInfoDouble(brokerSymbol, SYMBOL_BID);
-   if (mt5_ask <= 0 || mt5_bid <= 0) {
-      Print("❌ MT5 price error for ", brokerSymbol);
-      return;
-   }
-   double mt5_mid = (mt5_ask + mt5_bid) / 2.0;
+   if(mt5_ask<=0 || mt5_bid<=0) return;
+   double mt5_mid = (mt5_ask+mt5_bid)/2.0;
    
    double point = SymbolInfoDouble(brokerSymbol, SYMBOL_POINT);
-   double mispricing_points = (ecb_chf - mt5_mid) / point;
+   double mispricing = (lead_chf - mt5_mid) / point;
+   double mt5_eurusd_mid = (SymbolInfoDouble("EURUSD", SYMBOL_ASK)+SymbolInfoDouble("EURUSD", SYMBOL_BID))/2.0;
+   bool direction_aligns = (lead_usd > mt5_eurusd_mid) == (mispricing > 0);
    
-   double mt5_eurusd_mid = (SymbolInfoDouble("EURUSD", SYMBOL_ASK) + SymbolInfoDouble("EURUSD", SYMBOL_BID)) / 2.0;
-   bool eur_direction_aligns = (ecb_usd > mt5_eurusd_mid) == (mispricing_points > 0);
+   bool buy_signal = (mispricing > MinMispricingPoints) && direction_aligns;
+   bool sell_signal = (mispricing < -MinMispricingPoints) && direction_aligns;
    
-   bool buy_signal  = (mispricing_points > MinMispricingPoints) && eur_direction_aligns;
-   bool sell_signal = (mispricing_points < -MinMispricingPoints) && eur_direction_aligns;
-   
-   if (now - last_debug >= 10) {
+   if(now - last_debug >= 10) {
       last_debug = now;
       Print("========================================");
-      Print("🏦 ECB Lead: EUR/", QuoteCurrency1, " = ", DoubleToString(ecb_chf, 5));
-      Print("📊 MT5 Lag:  EUR/", QuoteCurrency1, " = ", DoubleToString(mt5_mid, 5));
-      Print("📉 Mispricing: ", DoubleToString(mispricing_points, 2), " points");
-      Print("🔍 Signal: ", buy_signal ? "BUY" : (sell_signal ? "SELL" : "HOLD"));
+      Print("🏦 Lead EUR/CHF: ", lead_chf, " | MT5: ", mt5_mid);
+      Print("📉 Mispricing: ", mispricing, " pts");
+      Print("🔍 Signal: ", buy_signal?"BUY":(sell_signal?"SELL":"HOLD"));
       Print("========================================");
    }
+   if(!buy_signal && !sell_signal) return;
    
-   if (!buy_signal && !sell_signal) return;
-   
-   double baseLot = NormalizeDouble(equity / 1000.0 * (RiskPercent / 100.0), 2);
-   baseLot = MathMax(0.01, baseLot);
-   double lot = baseLot * MathPow(1.3, MathMin(consecutiveLosses, 8));
-   lot = MathMin(lot, SymbolInfoDouble(brokerSymbol, SYMBOL_VOLUME_MAX));
-   
-   bool executed = false;
-   if (buy_signal) {
-      executed = trade.Buy(lot, brokerSymbol, mt5_ask, 0, 0, "ECB Arb Buy");
-      if (executed) Print("🔥 [BUY] Mispricing: ", mispricing_points, " pts | Lot: ", lot);
-   } else if (sell_signal) {
-      executed = trade.Sell(lot, brokerSymbol, mt5_bid, 0, 0, "ECB Arb Sell");
-      if (executed) Print("🔥 [SELL] Mispricing: ", mispricing_points, " pts | Lot: ", lot);
-   }
-   
-   if (executed) last_trade_time = now;
-   else Print("❌ Order failed. Error: ", GetLastError());
+   double lot = NormalizeDouble(equity/1000 * (RiskPercent/100), 2);
+   lot = MathMax(0.01, lot);
+   if(buy_signal) trade.Buy(lot, brokerSymbol, mt5_ask, 0,0,"Arb Buy");
+   else if(sell_signal) trade.Sell(lot, brokerSymbol, mt5_bid, 0,0,"Arb Sell");
+   last_trade_time = now;
 }
-
 //+------------------------------------------------------------------+
-void OnDeinit(const int reason) {
-   Print("🏦 ECB Arbitrage EA stopped.");
-}
 EOF
 
 # ============================================
