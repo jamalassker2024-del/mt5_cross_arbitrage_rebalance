@@ -21,13 +21,12 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
 //|                                      ECB_Arbitrage_Aggressor.mq5 |
-//|                     Uses ECB official rates as lead data feed   |
-//|                     + London session filter (8-22)             |
+//|                     ECB official rates + London session filter   |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
 #property copyright "Omni-Apex ECB Arbitrage"
-#property version   "5.00"
+#property version   "5.20"
 #property strict
 
 // --- INPUTS --------------------------------------------------------+
@@ -42,17 +41,15 @@ input double   MinProfitUSD           = 1.00;
 input double   TrailingLockStep       = 0.15;
 input int      MaxConsecutiveLosses   = 3;
 input double   MaxDailyLossPercent    = 8.0;
-input int      StartHour              = 8;          // London session start (server time)
-input int      EndHour                = 22;         // Session end – close all at this hour
+input int      StartHour              = 8;          // London session start (server time, 24h)
+input int      EndHour                = 22;         // Session end – all trades closed at this hour
 
 // --- GLOBALS -------------------------------------------------------+
 CTrade trade;
-string ecb_url;
 datetime last_debug = 0;
 datetime last_trade_time = 0;
 datetime dayStart = 0;
 double dailyEquityStart = 0;
-double dailyLoss = 0;
 bool tradingEnabled = true;
 int consecutiveLosses = 0;
 
@@ -63,7 +60,9 @@ double  lockValues[];
 //| Check if we are inside trading hours (server time)              |
 //+------------------------------------------------------------------+
 bool IsTradingTime() {
-   int hour = TimeHour(TimeCurrent());
+   MqlDateTime dt;
+   TimeCurrent(dt);          // Fills dt structure
+   int hour = dt.hour;
    return (hour >= StartHour && hour < EndHour);
 }
 
@@ -81,92 +80,50 @@ void CloseAllPositions() {
 }
 
 //+------------------------------------------------------------------+
-//| Fetch ECB exchange rates using a more reliable endpoint         |
-//| Returns true and fills ecb_chf_rate, ecb_usd_rate               |
+//| Fetch ECB exchange rates (CHF and USD against EUR)              |
 //+------------------------------------------------------------------+
 bool FetchECBRates(double &ecb_chf_rate, double &ecb_usd_rate) {
-   // Alternative endpoint that returns the latest available observation
-   // The previous URL sometimes returned only header. This one uses the generic series key.
-   string url = "https://data-api.ecb.europa.eu/service/data/EXR/D.CHF.EUR.SP00.A?format=jsondata&lastNObservations=1";
-   
+   // Fetch CHF rate
+   string url_chf = "https://data-api.ecb.europa.eu/service/data/EXR/D.CHF.EUR.SP00.A?format=jsondata&lastNObservations=1";
    char post[], result[];
    string headers;
-   int res = WebRequest("GET", url, NULL, NULL, 10000, post, 0, result, headers);
+   int res = WebRequest("GET", url_chf, NULL, NULL, 10000, post, 0, result, headers);
    if (res <= 0) {
       static int failCount = 0;
-      if (failCount++ % 50 == 0) Print("❌ ECB WebRequest failed. Error: ", GetLastError());
+      if (failCount++ % 50 == 0) Print("❌ ECB CHF request failed. Error: ", GetLastError());
       return false;
    }
-   
    string response = CharArrayToString(result);
    
-   // Parse the CHF rate: look for "value" under observations
-   // The structure is: ... "observations":{"0":{"0":[value]}} ...
+   // Extract first numeric value after "observations"
    int obsPos = StringFind(response, "\"observations\"");
-   if (obsPos == -1) {
-      static int parseFail = 0;
-      if (parseFail++ % 20 == 0) Print("❌ No observations in ECB response. Raw: ", StringSubstr(response, 0, 300));
-      return false;
-   }
-   
-   // Find the first numeric value after "0":
-   int valPos = StringFind(response, "\"0\":", obsPos);
+   if (obsPos == -1) return false;
+   int valPos = StringFind(response, "\"0\":[", obsPos);
    if (valPos == -1) return false;
-   valPos = StringFind(response, "[", valPos);
-   if (valPos == -1) return false;
-   int start = valPos + 1;
-   while (start < StringLen(response) && (StringSubstr(response, start, 1) == " " || 
-          StringSubstr(response, start, 1) == "\"" || 
-          StringSubstr(response, start, 1) == "[")) start++;
+   int start = valPos + 4;
    int end = start;
-   while (end < StringLen(response) && (StringSubstr(response, end, 1) >= "0" && 
-          StringSubstr(response, end, 1) <= "9") || StringSubstr(response, end, 1) == ".") end++;
+   while (end < StringLen(response) && (StringSubstr(response, end, 1) >= "0" && StringSubstr(response, end, 1) <= "9") || StringSubstr(response, end, 1) == ".") end++;
    if (end <= start) return false;
    string chfStr = StringSubstr(response, start, end - start);
    ecb_chf_rate = StringToDouble(chfStr);
    
-   // Now fetch USD rate similarly
-   url = "https://data-api.ecb.europa.eu/service/data/EXR/D.USD.EUR.SP00.A?format=jsondata&lastNObservations=1";
-   res = WebRequest("GET", url, NULL, NULL, 10000, post, 0, result, headers);
+   // Fetch USD rate
+   string url_usd = "https://data-api.ecb.europa.eu/service/data/EXR/D.USD.EUR.SP00.A?format=jsondata&lastNObservations=1";
+   res = WebRequest("GET", url_usd, NULL, NULL, 10000, post, 0, result, headers);
    if (res <= 0) return false;
    response = CharArrayToString(result);
    obsPos = StringFind(response, "\"observations\"");
    if (obsPos == -1) return false;
-   valPos = StringFind(response, "\"0\":", obsPos);
+   valPos = StringFind(response, "\"0\":[", obsPos);
    if (valPos == -1) return false;
-   valPos = StringFind(response, "[", valPos);
-   if (valPos == -1) return false;
-   start = valPos + 1;
-   while (start < StringLen(response) && (StringSubstr(response, start, 1) == " " || 
-          StringSubstr(response, start, 1) == "\"" || 
-          StringSubstr(response, start, 1) == "[")) start++;
+   start = valPos + 4;
    end = start;
-   while (end < StringLen(response) && (StringSubstr(response, end, 1) >= "0" && 
-          StringSubstr(response, end, 1) <= "9") || StringSubstr(response, end, 1) == ".") end++;
+   while (end < StringLen(response) && (StringSubstr(response, end, 1) >= "0" && StringSubstr(response, end, 1) <= "9") || StringSubstr(response, end, 1) == ".") end++;
    if (end <= start) return false;
    string usdStr = StringSubstr(response, start, end - start);
    ecb_usd_rate = StringToDouble(usdStr);
    
    return (ecb_chf_rate > 0 && ecb_usd_rate > 0);
-}
-
-//+------------------------------------------------------------------+
-//| Expert initialization                                           |
-//+------------------------------------------------------------------+
-int OnInit() {
-   trade.SetExpertMagicNumber(MagicNumber);
-   trade.SetTypeFilling(ORDER_FILLING_IOC);
-   SymbolSelect(_Symbol, true);
-   dayStart = TimeCurrent();
-   dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
-   
-   Print("==============================================");
-   Print("🏦 ECB ARBITRAGE EA - SESSION FILTER v5.0");
-   Print("   Pair: ", BaseCurrency, "/", QuoteCurrency1);
-   Print("   Trading hours: ", StartHour, ":00 - ", EndHour, ":00 (server time)");
-   Print("   MinMispricing: ", MinMispricingPoints, " pts | MinProfit: $", MinProfitUSD);
-   Print("==============================================");
-   return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
@@ -197,6 +154,25 @@ void AddLock(ulong ticket, double lockValue) {
 }
 
 //+------------------------------------------------------------------+
+//| Expert initialization                                           |
+//+------------------------------------------------------------------+
+int OnInit() {
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetTypeFilling(ORDER_FILLING_IOC);
+   SymbolSelect(_Symbol, true);
+   dayStart = TimeCurrent();
+   dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
+   
+   Print("==============================================");
+   Print("🏦 ECB ARBITRAGE EA with Session Filter");
+   Print("   Pair: ", BaseCurrency, "/", QuoteCurrency1);
+   Print("   Trading hours: ", StartHour, ":00 - ", EndHour, ":00 (server time)");
+   Print("   MinMispricing: ", MinMispricingPoints, " pts | MinProfit: $", MinProfitUSD);
+   Print("==============================================");
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
 //| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick() {
@@ -207,8 +183,9 @@ void OnTick() {
    }
    
    // Daily reset and loss limit
-   if (TimeCurrent() - dayStart >= 86400) {
-      dayStart = TimeCurrent();
+   datetime now = TimeCurrent();
+   if (now - dayStart >= 86400) {
+      dayStart = now;
       dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
       tradingEnabled = true;
       Print("✅ New trading day.");
@@ -263,7 +240,7 @@ void OnTick() {
    }
    
    if (PositionsTotal() >= MaxOpenPositions) return;
-   if (TimeCurrent() - last_trade_time < 5) return;
+   if (now - last_trade_time < 5) return;
    
    double ecb_chf, ecb_usd;
    if (!FetchECBRates(ecb_chf, ecb_usd)) return;
@@ -286,8 +263,8 @@ void OnTick() {
    bool buy_signal  = (mispricing_points > MinMispricingPoints) && eur_direction_aligns;
    bool sell_signal = (mispricing_points < -MinMispricingPoints) && eur_direction_aligns;
    
-   if (TimeCurrent() - last_debug >= 10) {
-      last_debug = TimeCurrent();
+   if (now - last_debug >= 10) {
+      last_debug = now;
       Print("========================================");
       Print("🏦 ECB Lead: EUR/", QuoteCurrency1, " = ", DoubleToString(ecb_chf, 5));
       Print("📊 MT5 Lag:  EUR/", QuoteCurrency1, " = ", DoubleToString(mt5_mid, 5));
@@ -312,7 +289,7 @@ void OnTick() {
       if (executed) Print("🔥 [SELL] Mispricing: ", mispricing_points, " pts | Lot: ", lot);
    }
    
-   if (executed) last_trade_time = TimeCurrent();
+   if (executed) last_trade_time = now;
    else Print("❌ Order failed. Error: ", GetLastError());
 }
 
